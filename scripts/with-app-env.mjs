@@ -107,7 +107,7 @@ export function isMainModule(moduleUrl) {
 function main(argv) {
   const [command, ...args] = argv;
   if (!command) {
-    console.error("usage: node scripts/with-app-env.mjs <command> [args\u2026]");
+    console.error("usage: node scripts/with-app-env.mjs <command> [args…]");
     process.exit(2);
   }
   const env = mergeAppEnv(readAppEnv(projectRoot()), process.env);
