@@ -23,7 +23,7 @@ The method is [Next-Concept Modeling](https://arxiv.org/abs/2610.14162) ([HazyRe
 | Piece | Where | What it does |
 | --- | --- | --- |
 | Browser lab | this app | Distill, train from scratch, or combine both on a tiny corpus, with a live ladder and samples |
-| Train notebook | [`src/lib/ncm/ncm_hybrid_colab.ipynb`](src/lib/ncm/ncm_hybrid_colab.ipynb) | The same recipe on a free Colab T4 (16 GB). Default teacher is `Qwen/Qwen2.5-0.5B-Instruct`. `Qwen2.5-1.5B-Instruct` also fits. 3B and larger are refused |
+| Train notebook | [`src/lib/ncm/ncm_hybrid_colab.ipynb`](src/lib/ncm/ncm_hybrid_colab.ipynb) | The same recipe on a free Colab T4 (16 GB), trained on CodeSearchNet Python functions. Default teacher is `Qwen/Qwen2.5-0.5B-Instruct`. `Qwen2.5-1.5B-Instruct` also fits. 3B and larger are refused |
 | Test notebook | [`src/lib/ncm/ncm_hybrid_test.ipynb`](src/lib/ncm/ncm_hybrid_test.ipynb) | Loads `hybrid.pt` and scores reconstruction, next-level codes, and the hybrid repair on text the training run did not use |
 
 ## What a short run will not do
@@ -52,7 +52,7 @@ npm run build
 ## Colab
 
 1. Runtime → Change runtime type → T4 GPU.
-2. Run the train notebook from the top. It writes `/content/ncm-hybrid/hybrid.pt`.
+2. Run the train notebook from the top. Training windows are real Python functions from CodeSearchNet, not a prompt list. It writes `/content/ncm-hybrid/hybrid.pt`.
 3. Run the test notebook. It looks for that file, then Drive, then asks for an upload.
 
 The teacher is loaded in fp16 and unloaded before the concept model trains. A 0.5B run stays under about 8 GB. A 1.5B run stays under about 12 GB.

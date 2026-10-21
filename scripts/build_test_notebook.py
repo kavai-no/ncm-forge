@@ -26,7 +26,7 @@ md(
 
 Loads `hybrid.pt` from the training notebook and tests it. Nothing here updates weights.
 
-The checkpoint was trained on text sampled from a teacher such as Qwen2.5-0.5B. This notebook samples a new batch with a different seed and a different prompt list, then asks three questions:
+The checkpoint was trained on CodeSearchNet Python functions. This notebook does not train. It loads the **test** split, which the training notebook never reads and which comes from other repositories, and asks three questions:
 
 1. Can the residual quantizer reconstruct those tokens?
 2. If the coarser codes are right, can the generator predict the next level?
@@ -40,7 +40,7 @@ Runtime → Change runtime type → **T4 GPU**. The teacher is loaded in fp16. A
 
 code(
     """
-%pip install -q "transformers>=4.46,<5" accelerate sentencepiece protobuf
+%pip install -q "transformers>=4.46,<5" accelerate sentencepiece protobuf datasets
 """
 )
 
@@ -60,20 +60,12 @@ CHECKPOINT_CANDIDATES = [
     Path("/content/drive/MyDrive/ncm-hybrid/hybrid.pt"),
     Path("hybrid.pt"),
 ]
-N_TEST = 32
+N_TEST = 256
 BENCH_BATCH = 4
+PREFIX = 32
 SEED = 99
-
-TEST_PROMPTS = [
-    "The creek was low",
-    "Write a field note about",
-    "At the market",
-    "Three boats left",
-    "Under the bridge",
-    "The last train",
-    "A green bottle",
-    "Before the rain",
-]
+DATASET_ID = "code-search-net/code_search_net"
+DATASET_CONFIG = "python"
 
 if not torch.cuda.is_available():
     raise SystemExit("No GPU. In Colab: Runtime → Change runtime type → T4 GPU, then rerun.")
@@ -151,7 +143,7 @@ md(
     """
 ## Held-out text
 
-These prompts are not the ones the training notebook used, and the seed is not the training seed. The concept model itself is not conditioned on the prompt. The prompt only steers the fresh teacher text used as the reconstruction target, and the teacher continuations in the speed table.
+CodeSearchNet's Python test split. The training notebook uses the training split and scores the validation split. Repositories do not cross splits. Windows are real functions, not teacher samples of a prompt list.
 """
 )
 
@@ -165,12 +157,12 @@ try:
 except Exception:
     pass
 
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "left"
 if int(tokenizer.vocab_size) != vocab:
     raise SystemExit(f"tokenizer vocab {tokenizer.vocab_size} does not match checkpoint vocab {vocab}")
 
@@ -180,36 +172,49 @@ teacher.eval()
 print(f"teacher resident {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
 
-def take_context(out, enc):
-    width = enc["input_ids"].shape[1]
-    rows = []
-    for i in range(out.shape[0]):
-        start = width - int(enc["attention_mask"][i].sum())
-        content = out[i, start : start + context]
-        if content.shape[0] < context:
-            content = torch.nn.functional.pad(content, (0, context - content.shape[0]), value=tokenizer.pad_token_id)
-        rows.append(content[:context].to(torch.long))
-    return torch.stack(rows)
+def code_windows(split: str, limit: int, seed: int) -> torch.Tensor:
+    ds = load_dataset(DATASET_ID, DATASET_CONFIG, split=split, streaming=True)
+    ds = ds.shuffle(buffer_size=2048, seed=seed)
+    need = limit * context
+    ids: list[int] = []
+    kept = 0
+    for row in ds:
+        text = (row.get("whole_func_string") or "").replace("\\r\\n", "\\n").strip()
+        if len(text) < 40 or "def " not in text:
+            continue
+        piece = tokenizer(text + "\\n", add_special_tokens=False)["input_ids"]
+        if len(piece) < 16 or len(piece) > 1024:
+            continue
+        ids.extend(piece)
+        kept += 1
+        if len(ids) >= need + context:
+            break
+    usable = (len(ids) // context) * context
+    if usable < need:
+        raise SystemExit(f"{split} produced {usable // context} windows, need {limit}.")
+    windows = torch.tensor(ids[:usable], dtype=torch.long).view(-1, context)
+    order = torch.randperm(windows.shape[0], generator=torch.Generator().manual_seed(seed))
+    chosen = windows[order[:limit]].contiguous()
+    print(f"{split}: {kept} functions, {tuple(chosen.shape)}")
+    return chosen
 
 
 @torch.no_grad()
-def sample_teacher_text(n, prompts, sample):
-    rows = []
-    cursor = 0
-    while len(rows) < n:
-        batch_prompts = [prompts[(cursor + i) % len(prompts)] for i in range(min(4, n - len(rows)))]
-        cursor += len(batch_prompts)
-        enc = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
-        out = teacher.generate(
-            **enc,
-            max_new_tokens=context,
-            do_sample=sample,
-            temperature=0.9,
-            top_p=0.95,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-        rows.extend(list(take_context(out, enc)))
-    return torch.stack(rows[:n])
+def teacher_from_prefixes(prefixes: torch.Tensor, sample: bool) -> torch.Tensor:
+    attention = torch.ones_like(prefixes)
+    out = teacher.generate(
+        input_ids=prefixes,
+        attention_mask=attention,
+        max_new_tokens=context,
+        do_sample=sample,
+        temperature=0.9,
+        top_p=0.95,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    cont = out[:, prefixes.shape[1] :]
+    if cont.shape[1] < context:
+        cont = torch.nn.functional.pad(cont, (0, context - cont.shape[1]), value=tokenizer.pad_token_id)
+    return cont[:, :context]
 """
 )
 
@@ -283,15 +288,14 @@ md(
     """
 ## Run the tests
 
-Reconstruction and concept accuracy use the fresh teacher sample. The speed table uses a greedy teacher continuation, an unconditional concept draft, and that draft after one repair pass. Negative log-likelihood is the teacher's own score of the finished text. Lower is closer to the teacher. It is not a human quality rating.
+Reconstruction and concept accuracy use CodeSearchNet test windows. The speed table continues the first `PREFIX` tokens of those windows with a greedy teacher, then compares that with an unconditional concept draft and the same draft after one repair pass. Negative log-likelihood is the teacher's score of the finished text. Lower is closer to the teacher. It is not a test of whether the code runs.
 """
 )
 
 code(
     """
-held = sample_teacher_text(N_TEST, TEST_PROMPTS, sample=True)
-print("held-out", tuple(held.shape))
-print(tokenizer.decode(held[0], skip_special_tokens=True)[:300])
+held = code_windows("test", N_TEST, SEED).to(device)
+print(tokenizer.decode(held[0].tolist(), skip_special_tokens=True)[:500])
 
 recon = reconstruction_accuracy(held)
 concept, per_level = concept_accuracy(held)
@@ -303,7 +307,7 @@ print(f"cascade from the coarsest code {cascade:.3%}")
 print("per level:", " ".join(f"L{i+1}:{acc:.2f}" for i, acc in enumerate(per_level)))
 
 with torch.no_grad():
-    teacher_tokens, teacher_ms, teacher_peak = cuda_ms(lambda: sample_teacher_text(BENCH_BATCH, TEST_PROMPTS, sample=False))
+    teacher_tokens, teacher_ms, teacher_peak = cuda_ms(lambda: teacher_from_prefixes(held[:BENCH_BATCH, :PREFIX], sample=False))
     teacher_nll_value = teacher_nll(teacher, teacher_tokens)
     draft, ncm_ms, ncm_peak = cuda_ms(lambda: generate_ncm(gen, vq, unigram, BENCH_BATCH))
     ncm_nll_value = teacher_nll(teacher, draft)
@@ -325,7 +329,7 @@ with torch.no_grad():
     hybrid_nll_value = teacher_nll(teacher, hybrid)
 
 rows = [
-    ("teacher", teacher_nll_value, context, teacher_ms / BENCH_BATCH, teacher_peak, "greedy continuation"),
+    ("teacher", teacher_nll_value, context, teacher_ms / BENCH_BATCH, teacher_peak, "greedy, from a function prefix"),
     ("next-concept", ncm_nll_value, len(levels), ncm_ms / BENCH_BATCH, ncm_peak, "unconditional draft"),
     ("hybrid", hybrid_nll_value, len(levels) + 1, (ncm_ms + repair_ms) / BENCH_BATCH, max(ncm_peak, repair_peak), f"repair rate {rate:.0%}"),
 ]

@@ -33,13 +33,13 @@ A next-concept model writes a whole level of discrete codes in one forward. The 
 
 The teacher is loaded in fp16, its embedding table is copied, then it is **deleted** before the concept model trains. It is loaded again only for the benchmark. Peak on a 0.5B run stays under 8 GB. A 1.5B run stays under 12 GB.
 
-Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. A default run is a few hundred tokenizer steps and a few hundred concept steps, on the order of 15–25 minutes plus sampling, not a paper-scale training job.
+Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet (real GitHub functions, split by repository), not a list of prompts and not Wikipedia. A default run uses a few thousand windows and a few hundred steps, on the order of 15–25 minutes. It does not see the whole corpus, and it will not learn to write a working program.
 """
 )
 
 code(
     """
-%pip install -q "transformers>=4.46,<5" accelerate sentencepiece protobuf
+%pip install -q "transformers>=4.46,<5" accelerate sentencepiece protobuf datasets
 """
 )
 
@@ -64,7 +64,9 @@ VQ_DIM = 256
 GEN_DIM = 384
 GEN_LAYERS = 6
 GEN_HEADS = 6
-N_SAMPLES = 384
+N_TRAIN = 4096
+N_VAL = 256
+PREFIX = 32
 VQ_STEPS = 500
 GEN_STEPS = 700
 BATCH = 8
@@ -73,18 +75,11 @@ TAU = 0.45
 SEED = 7
 OUTPUT = Path("/content/ncm-hybrid")
 
-PROMPTS = [
-    "The harbor bell",
-    "A quiet morning",
-    "Once, in the field",
-    "She counted the fish",
-    "Near the dock",
-    "After dawn",
-    "The red boat",
-    "He kept the lamp",
-    "Before noon",
-    "A silver fish",
-]
+# CodeSearchNet Python. Public, no HF gate. Train / validation / test are
+# split by repository. Each row is one function and its docstring.
+# The test split is left for the test notebook.
+DATASET_ID = "code-search-net/code_search_net"
+DATASET_CONFIG = "python"
 
 assert GEN_DIM % GEN_HEADS == 0, "GEN_DIM must divide evenly across heads"
 assert LEVELS[-1] == CONTEXT, "the finest level has to be the token length"
@@ -316,9 +311,13 @@ def cuda_ms(fn):
 
 md(
     """
-## Sample the teacher, then unload it
+## CodeSearchNet functions, then the teacher's embedding
 
-The concept model trains on tokens the teacher would have written, and its token table starts as a projection of the teacher's input embedding. After that copy, the teacher is deleted so the training steps have the GPU to themselves.
+Training rows are real Python functions from the CodeSearchNet training split, packed to `CONTEXT` tokens. The validation split is held out. The test split is not touched here. Repositories do not cross those splits.
+
+Wikipedia is the wrong corpus for this. A 128-token window of an article cannot be checked, and a lot of it is disputed or stale. A function can be read. This run still only sees a slice, and a few hundred steps will not produce correct programs. What it can show is whether the quantizer and the concept model fit real code tokens.
+
+The ten short prompts this notebook used to carry were only a way to start the teacher. Every training row was then a continuation of "the harbor" or "the red boat". Those prompts are gone. The teacher is loaded in fp16 long enough to copy its input embedding, then deleted. It does not write the training set.
 """
 )
 
@@ -335,49 +334,58 @@ try:
 except Exception:
     pass
 
+from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "left"
+
+
+def code_windows(split: str, limit: int, seed: int) -> torch.Tensor:
+    \"\"\"Non-overlapping token windows from CodeSearchNet functions.
+
+    Streaming, so this stops once `limit` windows are filled. It does not
+    download the whole 412k-function training split. Functions are not padded:
+    a window can start in the middle of a function.
+    \"\"\"
+    ds = load_dataset(DATASET_ID, DATASET_CONFIG, split=split, streaming=True)
+    ds = ds.shuffle(buffer_size=2048, seed=seed)
+    need = limit * CONTEXT
+    ids: list[int] = []
+    kept = 0
+    for row in ds:
+        text = (row.get("whole_func_string") or "").replace("\\r\\n", "\\n").strip()
+        if len(text) < 40 or "def " not in text:
+            continue
+        piece = tokenizer(text + "\\n", add_special_tokens=False)["input_ids"]
+        if len(piece) < 16 or len(piece) > 1024:
+            continue
+        ids.extend(piece)
+        kept += 1
+        if len(ids) >= need + CONTEXT:
+            break
+    usable = (len(ids) // CONTEXT) * CONTEXT
+    if usable < need:
+        raise SystemExit(
+            f"{split} produced {usable // CONTEXT} windows of {CONTEXT} tokens, need {limit}."
+        )
+    windows = torch.tensor(ids[:usable], dtype=torch.long).view(-1, CONTEXT)
+    order = torch.randperm(windows.shape[0], generator=torch.Generator().manual_seed(seed))
+    chosen = windows[order[:limit]].contiguous()
+    print(f"{split}: {kept} functions, {tuple(chosen.shape)}")
+    return chosen
+
+
+train = code_windows("train", N_TRAIN, SEED).to(device)
+held = code_windows("validation", N_VAL, SEED + 1).to(device)
+print(tokenizer.decode(train[0].tolist(), skip_special_tokens=True)[:500])
 
 teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16, low_cpu_mem_usage=True)
 teacher.to(device)
 teacher.eval()
 teacher_embed = teacher.get_input_embeddings().weight.detach().float().cpu()
 print(f"teacher resident {torch.cuda.memory_allocated()/1024**3:.2f} GB, embed {tuple(teacher_embed.shape)}")
-
-rows = []
-prompt_cycle = 0
-while len(rows) < N_SAMPLES:
-    batch_prompts = [PROMPTS[(prompt_cycle + i) % len(PROMPTS)] for i in range(4)]
-    prompt_cycle += len(batch_prompts)
-    enc = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
-    out = teacher.generate(
-        **enc,
-        max_new_tokens=CONTEXT,
-        do_sample=True,
-        temperature=0.9,
-        top_p=0.95,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    width = enc["input_ids"].shape[1]
-    for i in range(out.shape[0]):
-        start = width - int(enc["attention_mask"][i].sum())
-        content = out[i, start : start + CONTEXT]
-        if content.shape[0] < CONTEXT:
-            content = F.pad(content, (0, CONTEXT - content.shape[0]), value=tokenizer.pad_token_id)
-        rows.append(content[:CONTEXT].to(torch.long))
-    if len(rows) % 64 < 4:
-        print(f"sampled {min(len(rows), N_SAMPLES)}/{N_SAMPLES}", flush=True)
-
-data = torch.stack(rows[:N_SAMPLES]).to(device)
-held = data[: max(8, N_SAMPLES // 10)].contiguous()
-train = data[held.shape[0] :].contiguous()
-print("train", tuple(train.shape), "held-out", tuple(held.shape))
-print(tokenizer.decode(train[0], skip_special_tokens=True)[:240])
-
 del teacher
 gc.collect()
 torch.cuda.empty_cache()
@@ -478,69 +486,13 @@ md(
 
 Three writers, same length:
 
-- **Teacher** samples a continuation. One forward per new token.
-- **Next-concept** drafts the whole sequence. One forward per level.
+- **Teacher** continues the first `PREFIX` tokens of a validation window, which is the start or middle of a real function. One forward per new token.
+- **Next-concept** drafts a full window from the coarsest code. One forward per level. It is not shown that prefix.
 - **Hybrid** is that draft plus one teacher forward, which replaces tokens the teacher assigns probability below `TAU`.
 
-Quality is the teacher's own negative log-likelihood of the text (lower is closer to the teacher). Repair rate is the fraction of tokens the teacher actually changed. A short run will not match the teacher. The benchmark is there to show the gap, the step count, and the memory, not to claim a paper result.
+Quality is the teacher's negative log-likelihood of each writer (lower is closer to the teacher). Repair rate is the fraction of tokens the teacher actually changed. Read the decoded text. A short run will not match the teacher, and it will not be a working program. The table is the gap, the step count, and the memory.
 """
 )
-
-code(
-    """
-teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16, low_cpu_mem_usage=True)
-teacher.to(device)
-teacher.eval()
-
-bench_batch = 4
-results = []
-
-def record(name, forwards, fn):
-    (text, nll, extra), ms, peak = cuda_ms(fn)
-    results.append({
-        "name": name,
-        "forwards": forwards,
-        "ms": ms / bench_batch,
-        "nll": nll,
-        "peak_gb": peak,
-        "note": extra,
-        "text": text,
-    })
-    print(f"{name:16}  nll {nll:.3f}  {ms/bench_batch:.0f} ms/seq  {forwards} forwards  peak {peak:.2f} GB  {extra}")
-
-with torch.no_grad():
-    record(
-        "teacher",
-        CONTEXT,
-        lambda: _teacher_batch(),
-    )
-
-def _teacher_batch():
-    enc = tokenizer([PROMPTS[i % len(PROMPTS)] for i in range(bench_batch)], return_tensors="pt", padding=True).to(device)
-    out = teacher.generate(
-        **enc,
-        max_new_tokens=CONTEXT,
-        do_sample=False,
-        pad_token_id=tokenizer.pad_token_id,
-    )
-    width = enc["input_ids"].shape[1]
-    rows = []
-    for i in range(bench_batch):
-        start = width - int(enc["attention_mask"][i].sum())
-        content = out[i, start : start + CONTEXT]
-        if content.shape[0] < CONTEXT:
-            content = F.pad(content, (0, CONTEXT - content.shape[0]), value=tokenizer.pad_token_id)
-        rows.append(content[:CONTEXT])
-    tokens = torch.stack(rows)
-    return tokenizer.decode(tokens[0], skip_special_tokens=True)[:280], teacher_nll(teacher, tokens), "greedy"
-
-# redefine record path cleanly — the lambda above calls _teacher_batch before it exists if record runs immediately.
-# The cell below is the real benchmark. This placeholder is replaced by the following statements.
-"""
-)
-
-# The cell above is broken because of the lambda ordering. I'll replace that cell entirely below.
-CELLS.pop()
 
 code(
     """
@@ -551,22 +503,19 @@ bench_batch = 4
 
 
 def teacher_continuations():
-    enc = tokenizer([PROMPTS[i % len(PROMPTS)] for i in range(bench_batch)], return_tensors="pt", padding=True).to(device)
+    prefixes = held[:bench_batch, :PREFIX]
+    attention = torch.ones_like(prefixes)
     out = teacher.generate(
-        **enc,
+        input_ids=prefixes,
+        attention_mask=attention,
         max_new_tokens=CONTEXT,
         do_sample=False,
         pad_token_id=tokenizer.pad_token_id,
     )
-    width = enc["input_ids"].shape[1]
-    rows = []
-    for i in range(bench_batch):
-        start = width - int(enc["attention_mask"][i].sum())
-        content = out[i, start : start + CONTEXT]
-        if content.shape[0] < CONTEXT:
-            content = F.pad(content, (0, CONTEXT - content.shape[0]), value=tokenizer.pad_token_id)
-        rows.append(content[:CONTEXT])
-    return torch.stack(rows)
+    cont = out[:, PREFIX:]
+    if cont.shape[1] < CONTEXT:
+        cont = F.pad(cont, (0, CONTEXT - cont.shape[1]), value=tokenizer.pad_token_id)
+    return cont[:, :CONTEXT]
 
 
 def run_ncm():
@@ -586,7 +535,7 @@ with torch.no_grad():
     hybrid_nll_value = teacher_nll(teacher, hybrid)
 
 rows = [
-    ("teacher", teacher_nll_value, CONTEXT, teacher_ms / bench_batch, teacher_peak, "greedy continuation"),
+    ("teacher", teacher_nll_value, CONTEXT, teacher_ms / bench_batch, teacher_peak, "greedy, from a function prefix"),
     ("next-concept", ncm_nll_value, len(LEVELS), ncm_ms / bench_batch, ncm_peak, "draft"),
     ("hybrid", hybrid_nll_value, len(LEVELS) + 1, (ncm_ms + repair_ms) / bench_batch, max(ncm_peak, repair_peak), f"repair rate {repair_rate:.0%}"),
 ]
@@ -643,6 +592,8 @@ OUTPUT.mkdir(parents=True, exist_ok=True)
 torch.save(
     {
         "model": MODEL_ID,
+        "dataset": DATASET_ID,
+        "dataset_config": DATASET_CONFIG,
         "levels": LEVELS,
         "codebook": CODEBOOK,
         "vq_dim": VQ_DIM,
