@@ -33,7 +33,9 @@ A next-concept model writes a whole level of discrete codes in one forward. The 
 
 The teacher is loaded in fp16, its embedding table is copied, then it is **deleted** before the concept model trains. It is loaded again only for the benchmark. Peak on a 0.5B run stays under 8 GB. A 1.5B run stays under 12 GB.
 
-Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet (real GitHub functions, split by repository). A default run is about 1,500 steps on the tokenizer and 1,500 on the generator, on the order of 30–40 minutes. The tokenizer decoder is a 2-layer transformer. The previous linear decoder is why reconstruction stalled near 56%, and a continuation cannot be Python until that number is near the paper's 99%. This run still does not see the whole corpus.
+Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet, in Qwen's own vocabulary. This is the long run: 32,768 windows, a 4,096-code book, a 4-layer decoder, and a concept grid whose coarsest code covers 8 tokens. A 64-token prefix pins half of every level, and the model continues the function from there. Budget about 6,000 tokenizer steps and 8,000 generator steps, on the order of two hours. A checkpoint is written every 1,000 steps to `/content/ncm-hybrid/hybrid.pt`. Rerun the training cell after a disconnect and it resumes if the architecture matches.
+
+This is still not the paper's training run (billions of tokens, a ~100M generator). Judge it by the round trip and by whether the continuation contains code, not by teacher NLL. A string of `=` can score better than a real function.
 """
 )
 
@@ -57,18 +59,22 @@ import torch.nn.functional as F
 # Free Colab T4. Do not point this at a 7B checkpoint.
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
+# Qwen's vocabulary. The coarsest code covers 8 tokens. A 64-token prefix
+# pins half of every level, so the model continues a function instead of
+# guessing 96 tokens from three codes.
 CONTEXT = 128
-LEVELS = [4, 8, 16, 32, 48, 64, 80, 96, 112, 128]
-CODEBOOK = 2048
+LEVELS = [16, 32, 48, 64, 80, 96, 112, 128]
+CODEBOOK = 4096
 VQ_DIM = 384
-GEN_DIM = 384
-GEN_LAYERS = 6
-GEN_HEADS = 6
-N_TRAIN = 4096
-N_VAL = 256
-PREFIX = 32
-VQ_STEPS = 1500
-GEN_STEPS = 1500
+GEN_DIM = 512
+GEN_LAYERS = 8
+GEN_HEADS = 8
+DEC_LAYERS = 4
+N_TRAIN = 32768
+N_VAL = 512
+PREFIX = 64
+VQ_STEPS = 6000
+GEN_STEPS = 8000
 BATCH = 8
 GEN_BATCH = 16
 LR = 3e-4
@@ -106,8 +112,8 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 device = torch.device("cuda")
 print(
-    f"teacher {MODEL_ID} | context {CONTEXT} | levels {len(LEVELS)} | "
-    f"codebook {CODEBOOK} | vq {VQ_DIM} | generator {GEN_LAYERS}x{GEN_DIM}"
+    f"teacher {MODEL_ID} | context {CONTEXT} | prefix {PREFIX} | levels {len(LEVELS)} | "
+    f"codebook {CODEBOOK} | vq {VQ_DIM} x {DEC_LAYERS} | generator {GEN_LAYERS}x{GEN_DIM}"
 )
 print("Budget: unload the teacher before training. 0.5B peak < 8 GB, 1.5B peak < 12 GB.")
 """
@@ -417,6 +423,8 @@ def code_windows(split: str, limit: int, seed: int) -> torch.Tensor:
             continue
         ids.extend(piece)
         kept += 1
+        if kept % 500 == 0:
+            print(f"{split}: {kept} functions, {len(ids) // CONTEXT} windows", flush=True)
         if len(ids) >= need + CONTEXT:
             break
     usable = (len(ids) // CONTEXT) * CONTEXT
@@ -451,17 +459,66 @@ md(
     """
 ## Train the hierarchy
 
-Stage 1 is the multiscale residual tokenizer from the NCM paper. The decoder is a 2-layer transformer over the running reconstruction. A linear map from a 256-d code cannot name a 152k-word token, which is why the last run topped out at 56% reconstruction. The codebook is trained with the codebook loss and no weight decay. Stage 2 freezes the tokenizer. Each finer level is predicted from the reconstruction so far. The coarsest level has nothing coarser to look at, so it now reads the function prefix itself. The previous run predicted that level from zeros and only pasted the prefix onto the finished draft, which is why the continuation was generic Python (`self`, quotes, `to`) instead of the rest of the function. The first 40% of generator steps train the coarse levels. Both stages stay in fp32.
+Stage 1 is the multiscale residual tokenizer. The decoder is 4 transformer layers over the running reconstruction, the codebook has 4,096 entries, and both the commitment loss and the codebook loss train it. Stage 2 freezes that tokenizer. The generator is 8 layers wide 512. The first level is 16 codes, so each code is 8 tokens, and the 64-token prefix fixes the first half of every level. Loss on the coarsest level is only the future half. Checkpoints land in `/content/ncm-hybrid/hybrid.pt` every 1,000 steps. Both stages stay in fp32.
 """
 )
 
 code(
     """
 vocab = int(tokenizer.vocab_size)
-vq = MultiScaleResidualVQ(vocab, VQ_DIM, CODEBOOK, LEVELS, n_head=GEN_HEADS).to(device)
+vq = MultiScaleResidualVQ(vocab, VQ_DIM, CODEBOOK, LEVELS, n_dec=DEC_LAYERS, n_head=GEN_HEADS).to(device)
 init_from_teacher(vq, teacher_embed)
 del teacher_embed
 print(f"VQ parameters {sum(p.numel() for p in vq.parameters())/1e6:.1f} M, allocated {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+
+OUTPUT.mkdir(parents=True, exist_ok=True)
+ckpt_path = OUTPUT / "hybrid.pt"
+resume = None
+if ckpt_path.exists():
+    loaded = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    same = (
+        list(loaded.get("levels", [])) == list(LEVELS)
+        and int(loaded.get("codebook", -1)) == CODEBOOK
+        and int(loaded.get("vq_dim", -1)) == VQ_DIM
+        and int(loaded.get("gen_dim", -1)) == GEN_DIM
+        and int(loaded.get("gen_layers", -1)) == GEN_LAYERS
+        and int(loaded.get("dec_layers", -1)) == DEC_LAYERS
+        and int(loaded.get("prefix", -1)) == PREFIX
+        and "vq" in loaded
+    )
+    if same:
+        resume = loaded
+        print(f"resuming from {ckpt_path}  tokenizer {int(loaded.get('vq_step', 0))}  generator {int(loaded.get('gen_step', 0))}")
+    else:
+        print("checkpoint at", ckpt_path, "is a different architecture, starting over")
+
+
+def save_checkpoint(vq_step, gen_step, generator=None, prior=None):
+    payload = {
+        "model": MODEL_ID,
+        "dataset": DATASET_ID,
+        "dataset_config": DATASET_CONFIG,
+        "levels": LEVELS,
+        "codebook": CODEBOOK,
+        "vq_dim": VQ_DIM,
+        "gen_dim": GEN_DIM,
+        "gen_layers": GEN_LAYERS,
+        "gen_heads": GEN_HEADS,
+        "dec_layers": DEC_LAYERS,
+        "prefix": PREFIX,
+        "tau": TAU,
+        "vq_step": vq_step,
+        "gen_step": gen_step,
+        "vq": vq.state_dict(),
+        "vq_history": vq_history,
+        "gen_history": gen_history,
+    }
+    if generator is not None and prior is not None:
+        payload["generator"] = generator.state_dict()
+        payload["unigram"] = prior.detach().cpu()
+    torch.save(payload, ckpt_path)
+    print(f"saved {ckpt_path}  tokenizer {vq_step}  generator {gen_step}", flush=True)
+
 
 decay, plain = [], []
 for name, param in vq.named_parameters():
@@ -471,9 +528,15 @@ opt = torch.optim.AdamW(
     lr=LR,
 )
 vq_history = []
+gen_history = []
+start_vq = 0
+if resume is not None:
+    vq.load_state_dict(resume["vq"])
+    start_vq = min(VQ_STEPS, int(resume.get("vq_step", 0)))
+    vq_history = list(resume.get("vq_history", []))
 vq.train()
 t0 = time.time()
-for step in range(VQ_STEPS):
+for step in range(start_vq, VQ_STEPS):
     ix = torch.randint(0, train.shape[0], (BATCH,), device=device)
     if step < VQ_STEPS // 3 or torch.rand((), device=device).item() > 0.3:
         keep = len(LEVELS)
@@ -487,20 +550,27 @@ for step in range(VQ_STEPS):
     if step % 25 == 0 or step == VQ_STEPS - 1:
         vq_history.append((step, loss.item(), acc.item()))
         print(f"[tokenizer] {step:4d}  loss {loss.item():.3f}  acc {acc.item():.3f}  {time.time()-t0:.0f}s", flush=True)
+    if step % 1000 == 999 or step == VQ_STEPS - 1:
+        save_checkpoint(step + 1, 0)
 
 for p in vq.parameters():
     p.requires_grad_(False)
 vq.eval()
 
 with torch.no_grad():
-    chunks = [vq.encode(train[i : i + 16])[0].reshape(-1) for i in range(0, train.shape[0], 16)]
+    prior_rows = train[:4096]
+    chunks = [vq.encode(prior_rows[i : i + 16])[0].reshape(-1) for i in range(0, prior_rows.shape[0], 16)]
     counts = torch.bincount(torch.cat(chunks), minlength=CODEBOOK).float()
 unigram = (counts + 0.1) / (counts + 0.1).sum()
 unigram = unigram.to(device)
 
 gen = NextConcept(vq, GEN_DIM, GEN_LAYERS, GEN_HEADS).to(device)
 gopt = torch.optim.AdamW((p for p in gen.parameters() if p.requires_grad), lr=LR)
-gen_history = []
+start_gen = 0
+if resume is not None and "generator" in resume:
+    gen.load_state_dict(resume["generator"])
+    start_gen = min(GEN_STEPS, int(resume.get("gen_step", 0)))
+    gen_history = list(resume.get("gen_history", []))
 gen.train()
 t1 = time.time()
 coarse_until = int(GEN_STEPS * 0.4)
@@ -508,7 +578,7 @@ coarse_hi = max(i for i, length in enumerate(LEVELS) if length <= PREFIX)
 coarse_future = [i for i, (start, _end) in enumerate(vq._bins(CONTEXT, LEVELS[0])) if start >= PREFIX]
 if not coarse_future:
     raise RuntimeError("PREFIX covers every coarsest bin, so there is nothing to continue")
-for step in range(GEN_STEPS):
+for step in range(start_gen, GEN_STEPS):
     ix = torch.randint(0, train.shape[0], (GEN_BATCH,), device=device)
     with torch.no_grad():
         codes, recons = vq.contexts(train[ix])
@@ -548,6 +618,8 @@ for step in range(GEN_STEPS):
         acc = correct / max(1, total)
         gen_history.append((step, loss.item(), acc))
         print(f"[concepts]  {step:4d}  loss {loss.item():.3f}  acc {acc:.3f}  {time.time()-t1:.0f}s", flush=True)
+    if step % 1000 == 999 or step == GEN_STEPS - 1:
+        save_checkpoint(VQ_STEPS, step + 1, gen, unigram)
 
 gen.eval()
 correct = 0
@@ -661,10 +733,34 @@ for name, nll, forwards, ms, peak, note in rows:
 
 print("\\n--- teacher ---")
 print(tokenizer.decode(teacher_tokens[0], skip_special_tokens=True)[:500])
+print("\\n--- round trip (tokenizer ceiling on this window) ---")
+with torch.no_grad():
+    trip = vq.logits_from_codes(vq.encode(held[:1])).argmax(-1)
+print(tokenizer.decode(trip[0].tolist(), skip_special_tokens=True)[:500])
 print("\\n--- next-concept draft ---")
 print(tokenizer.decode(draft[0], skip_special_tokens=True)[:500])
 print("\\n--- hybrid ---")
 print(tokenizer.decode(hybrid[0], skip_special_tokens=True)[:500])
+
+
+def letter_frac(token_rows):
+    scores = []
+    for row in token_rows[:, PREFIX:].tolist():
+        hit = 0
+        for token_id in row:
+            if any(ch.isalpha() for ch in tokenizer.decode([token_id])):
+                hit += 1
+        scores.append(hit / max(1, len(row)))
+    return sum(scores) / max(1, len(scores))
+
+
+print(
+    "continuation tokens with a letter: "
+    f"teacher {letter_frac(teacher_tokens):.0%}  "
+    f"draft {letter_frac(draft):.0%}  "
+    f"hybrid {letter_frac(hybrid):.0%}"
+)
+print("A draft of '=' and quotes lands near 0%. Trust this line, not the NLL.")
 """
 )
 
@@ -696,7 +792,7 @@ md(
     """
 ## Save
 
-Weights land in `/content/ncm-hybrid/hybrid.pt`. Colab wipes `/content` when the runtime dies. The next cell copies that file to Drive if you want to keep it. It asks for Google Drive permission and does nothing until you run it.
+Weights are already checkpointed every 1,000 steps at `/content/ncm-hybrid/hybrid.pt`. This cell writes the finished file, including the benchmark. Colab wipes `/content` when the runtime dies. The next cell copies that file to Drive if you want to keep it.
 
 Score the checkpoint with `ncm_hybrid_test.ipynb`. That notebook does not train. It reloads this file and tests reconstruction, next-level code accuracy, and the hybrid repair on text this run did not use.
 """
@@ -716,10 +812,16 @@ torch.save(
         "gen_dim": GEN_DIM,
         "gen_layers": GEN_LAYERS,
         "gen_heads": GEN_HEADS,
+        "dec_layers": DEC_LAYERS,
+        "prefix": PREFIX,
         "tau": TAU,
+        "vq_step": VQ_STEPS,
+        "gen_step": GEN_STEPS,
         "vq": vq.state_dict(),
         "generator": gen.state_dict(),
         "unigram": unigram.detach().cpu(),
+        "vq_history": vq_history,
+        "gen_history": gen_history,
         "benchmark": [
             {"name": name, "nll": nll, "forwards": forwards, "ms_per_seq": ms, "peak_gb": peak, "note": note}
             for name, nll, forwards, ms, peak, note in rows

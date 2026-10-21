@@ -123,9 +123,12 @@ codebook = int(ckpt["codebook"])
 if int(ckpt["vq"]["codebooks.0"].shape[0]) != codebook:
     raise SystemExit("codebook size in the file does not match the codebook tensor")
 
-vq = MultiScaleResidualVQ(vocab, int(ckpt["vq_dim"]), codebook, levels).to(device)
-gen = NextConcept(vq, int(ckpt["gen_dim"]), int(ckpt["gen_layers"]), int(ckpt["gen_heads"])).to(device)
-incompatible = gen.load_state_dict(ckpt["generator"], strict=True)
+n_dec = int(ckpt.get("dec_layers", 2))
+n_head = int(ckpt["gen_heads"])
+PREFIX = int(ckpt.get("prefix", PREFIX))
+vq = MultiScaleResidualVQ(vocab, int(ckpt["vq_dim"]), codebook, levels, n_dec=n_dec, n_head=n_head).to(device)
+gen = NextConcept(vq, int(ckpt["gen_dim"]), int(ckpt["gen_layers"]), n_head).to(device)
+gen.load_state_dict(ckpt["generator"], strict=True)
 unigram = ckpt["unigram"].to(device).float()
 unigram = unigram / unigram.sum()
 vq.eval()
@@ -133,9 +136,8 @@ gen.eval()
 tau = float(ckpt["tau"])
 context = levels[-1]
 print(f"loaded {checkpoint_path}")
-print(f"teacher id {model_id} | context {context} | levels {len(levels)} | tau {tau}")
+print(f"teacher id {model_id} | context {context} | prefix {PREFIX} | levels {len(levels)} | tau {tau}")
 print(f"allocated {torch.cuda.memory_allocated()/1024**3:.2f} GB")
-del incompatible
 """
 )
 

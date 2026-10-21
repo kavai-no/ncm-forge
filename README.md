@@ -28,7 +28,7 @@ The method is [Next-Concept Modeling](https://arxiv.org/abs/2610.14162) ([HazyRe
 
 ## What a short run will not do
 
-The lab is a miniature. A default Colab run is about 1,500 steps on each stage, not a paper-scale training job. It can show whether reconstruction, next-level codes, and the repair rule are working. It will not reproduce the LM1B, OpenWebText, or XSum numbers in the paper. The test notebook says so when a short run misses a check.
+The lab is a miniature. The Colab notebook is the Qwen-vocabulary training run: 32,768 CodeSearchNet windows, a 4,096-code book, a 4-layer decoder, and an 8-layer generator. A 64-token prefix pins half of every concept level and the model continues the function. A default run is about two hours, with a checkpoint every 1,000 steps. It is still not the paper's training job (billions of tokens). It will not reproduce the LM1B, OpenWebText, or XSum numbers. Judge a run by the round trip and by whether the continuation contains code, not by teacher NLL.
 
 Teacher weights stay under their own licenses. The MIT license in this repository covers this code only.
 
