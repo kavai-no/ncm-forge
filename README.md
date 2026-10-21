@@ -40,7 +40,7 @@ Teacher weights stay under their own licenses. The MIT license in this repositor
 ## Develop
 
 ```bash
-npm ci
+npm install
 npm run dev
 npm test
 npm run typecheck
