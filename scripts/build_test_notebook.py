@@ -239,14 +239,14 @@ def concept_accuracy(tokens):
     total = 0
     for start in range(0, tokens.shape[0], 4):
         batch = tokens[start : start + 4]
-        codes = vq.encode(batch)
-        for li in range(1, len(levels)):
-            pred = gen.forward_level(codes, li).argmax(-1)
+        codes, recons = vq.contexts(batch)
+        for li in range(len(levels)):
+            pred = gen.forward_level(recons[li], li).argmax(-1)
             hit = (pred == codes[li]).sum().item()
-            if len(per_level) < li:
+            if len(per_level) <= li:
                 per_level.append([0, 0])
-            per_level[li - 1][0] += hit
-            per_level[li - 1][1] += codes[li].numel()
+            per_level[li][0] += hit
+            per_level[li][1] += codes[li].numel()
             correct += hit
             total += codes[li].numel()
     return correct / max(1, total), [hit / count for hit, count in per_level]
@@ -258,10 +258,12 @@ def cascade_accuracy(tokens):
     total = 0
     for start in range(0, tokens.shape[0], 4):
         batch = tokens[start : start + 4]
-        true = vq.encode(batch)
-        codes = [true[0]]
-        for li in range(1, len(levels)):
-            codes.append(gen.forward_level(codes, li).argmax(-1))
+        recon = torch.zeros(batch.shape[0], batch.shape[1], vq.dim, device=batch.device)
+        codes = []
+        for li in range(len(levels)):
+            idx = gen.forward_level(recon, li).argmax(-1)
+            codes.append(idx)
+            recon = vq.add_level(recon, idx, li)
         pred = vq.logits_from_codes(codes).argmax(-1)
         correct += (pred == batch).sum().item()
         total += batch.numel()
@@ -305,9 +307,9 @@ concept, per_level = concept_accuracy(held)
 cascade = cascade_accuracy(held)
 chance = 1.0 / vocab
 print(f"tokenizer reconstruction {recon:.3%}   chance {chance:.4%}")
-print(f"next-level code accuracy {concept:.3%}   (teacher-forced coarser codes)")
+print(f"next-level code accuracy {concept:.3%}   (conditioned on the true reconstruction so far)")
 print(f"cascade from the coarsest code {cascade:.3%}")
-print("per level:", " ".join(f"L{i+1}:{acc:.2f}" for i, acc in enumerate(per_level)))
+print("per level:", " ".join(f"L{i}:{acc:.2f}" for i, acc in enumerate(per_level)))
 
 with torch.no_grad():
     teacher_tokens, teacher_ms, teacher_peak = cuda_ms(lambda: teacher_from_prefixes(held[:BENCH_BATCH, :PREFIX], sample=False))

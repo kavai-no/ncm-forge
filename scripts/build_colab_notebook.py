@@ -33,7 +33,7 @@ A next-concept model writes a whole level of discrete codes in one forward. The 
 
 The teacher is loaded in fp16, its embedding table is copied, then it is **deleted** before the concept model trains. It is loaded again only for the benchmark. Peak on a 0.5B run stays under 8 GB. A 1.5B run stays under 12 GB.
 
-Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet (real GitHub functions, split by repository). A default run is about 1,500 steps on the tokenizer and 1,500 on the generator, on the order of 30–40 minutes. It does not see the whole corpus, and it will not learn to write a working program. The draft continues the same function prefix the teacher sees. A draft that ignores that prefix collapses to commas and spaces, which is what a short unconditional run produces.
+Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet (real GitHub functions, split by repository). A default run is about 1,500 steps on the tokenizer and 1,500 on the generator, on the order of 30–40 minutes. The tokenizer decoder is a 2-layer transformer. The previous linear decoder is why reconstruction stalled near 56%, and a continuation cannot be Python until that number is near the paper's 99%. This run still does not see the whole corpus.
 """
 )
 
@@ -60,7 +60,7 @@ MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 CONTEXT = 128
 LEVELS = [4, 8, 16, 32, 48, 64, 80, 96, 112, 128]
 CODEBOOK = 2048
-VQ_DIM = 256
+VQ_DIM = 384
 GEN_DIM = 384
 GEN_LAYERS = 6
 GEN_HEADS = 6
@@ -83,6 +83,7 @@ DATASET_ID = "code-search-net/code_search_net"
 DATASET_CONFIG = "python"
 
 assert GEN_DIM % GEN_HEADS == 0, "GEN_DIM must divide evenly across heads"
+assert VQ_DIM % GEN_HEADS == 0, "VQ_DIM must divide evenly across heads"
 assert LEVELS[-1] == CONTEXT, "the finest level has to be the token length"
 
 if not torch.cuda.is_available():
@@ -115,9 +116,9 @@ print("Budget: unload the teacher before training. 0.5B peak < 8 GB, 1.5B peak <
 code(
     """
 class MultiScaleResidualVQ(nn.Module):
-    \"\"\"Residual vector quantizer. One codebook per level. The finest level is one code per token.\"\"\"
+    \"\"\"Residual vector quantizer. One codebook per level. A small transformer, not a linear map, reads the reconstruction back into tokens.\"\"\"
 
-    def __init__(self, vocab: int, dim: int, codebook: int, levels: list[int]):
+    def __init__(self, vocab: int, dim: int, codebook: int, levels: list[int], n_dec: int = 2, n_head: int = 6):
         super().__init__()
         self.levels = levels
         self.dim = dim
@@ -125,8 +126,15 @@ class MultiScaleResidualVQ(nn.Module):
         self.codebooks = nn.ParameterList(
             [nn.Parameter(torch.randn(codebook, dim) * 0.02) for _ in range(len(levels))]
         )
-        self.dec = nn.Linear(dim, vocab, bias=False)
-        self.dec.weight = self.embed.weight
+        self.dec_blocks = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(dim, n_head, dim * 4, dropout=0.0, batch_first=True, norm_first=True, activation="gelu")
+                for _ in range(n_dec)
+            ]
+        )
+        self.dec_norm = nn.LayerNorm(dim)
+        self.dec_head = nn.Linear(dim, vocab, bias=False)
+        self.dec_head.weight = self.embed.weight
         nn.init.normal_(self.embed.weight, std=0.02)
 
     def _bins(self, t: int, length: int) -> list[tuple[int, int]]:
@@ -156,27 +164,47 @@ class MultiScaleResidualVQ(nn.Module):
         return idx, book[idx]
 
     def encode(self, tokens: torch.Tensor) -> list[torch.Tensor]:
+        indices, _before = self.contexts(tokens)
+        return indices
+
+    def contexts(self, tokens: torch.Tensor) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        \"\"\"Codes for every level, and the cumulative reconstruction from before that level.\"\"\"
         residual = self.embed(tokens)
+        recon = torch.zeros_like(residual)
         indices = []
+        before = []
         for li, length in enumerate(self.levels):
+            before.append(recon)
             pooled, bins = self._pool(residual, length)
             idx, q = self.quantize(pooled, li)
-            residual = residual - self._upsample(q, bins, tokens.shape[1])
+            up = self._upsample(q, bins, tokens.shape[1])
+            residual = residual - up
+            recon = recon + up
             indices.append(idx)
-        return indices
+        return indices, before
+
+    def add_level(self, recon: torch.Tensor, idx: torch.Tensor, level: int) -> torch.Tensor:
+        bins = self._bins(recon.shape[1], self.levels[level])
+        return recon + self._upsample(self.codebooks[level][idx], bins, recon.shape[1])
+
+    def _decode(self, recon: torch.Tensor) -> torch.Tensor:
+        h = recon
+        for block in self.dec_blocks:
+            h = block(h)
+        return self.dec_head(self.dec_norm(h))
 
     def logits_from_codes(self, indices: list[torch.Tensor]) -> torch.Tensor:
         t = self.levels[-1]
-        z = self.embed.weight.new_zeros(indices[0].shape[0], t, self.dim)
+        recon = self.embed.weight.new_zeros(indices[0].shape[0], t, self.dim)
         for li, idx in enumerate(indices):
-            bins = self._bins(t, self.levels[li])
-            z = z + self._upsample(self.codebooks[li][idx], bins, t)
-        return self.dec(z)
+            recon = self.add_level(recon, idx, li)
+        return self._decode(recon)
 
     def reconstruction_loss(self, tokens: torch.Tensor, keep: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         residual = self.embed(tokens)
-        z = torch.zeros_like(residual)
-        commit = tokens.new_zeros(())
+        recon = torch.zeros_like(residual)
+        commit = tokens.new_zeros((), dtype=torch.float)
+        book = tokens.new_zeros((), dtype=torch.float)
         n = keep or len(self.levels)
         for li in range(n):
             pooled, bins = self._pool(residual, self.levels[li])
@@ -184,39 +212,17 @@ class MultiScaleResidualVQ(nn.Module):
             q_st = pooled + (q - pooled).detach()
             up = self._upsample(q_st, bins, tokens.shape[1])
             residual = residual - up
-            z = z + up
+            recon = recon + up
             commit = commit + (pooled - q.detach()).pow(2).mean()
-        logits = self.dec(z)
+            book = book + (q - pooled.detach()).pow(2).mean()
+        logits = self._decode(recon)
         ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), tokens.reshape(-1))
         acc = (logits.argmax(-1) == tokens).float().mean()
-        return ce + 0.25 * (commit / n), acc
-
-    @torch.no_grad()
-    def ema_update(self, tokens: torch.Tensor, decay: float = 0.96) -> None:
-        # Move each codebook toward the residuals assigned to it. Dead codes get a pooled vector.
-        residual = self.embed(tokens)
-        for li, length in enumerate(self.levels):
-            pooled, bins = self._pool(residual, length)
-            idx, q = self.quantize(pooled, li)
-            residual = residual - self._upsample(q, bins, tokens.shape[1])
-            flat_idx = idx.reshape(-1)
-            flat_p = pooled.reshape(-1, self.dim)
-            book = self.codebooks[li]
-            sums = torch.zeros_like(book)
-            counts = torch.zeros(book.shape[0], device=book.device, dtype=book.dtype)
-            sums.index_add_(0, flat_idx, flat_p)
-            counts.index_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=book.dtype))
-            seen = counts > 0
-            book[seen] = decay * book[seen] + (1 - decay) * (sums[seen] / counts[seen].unsqueeze(1))
-            dead = (~seen).nonzero(as_tuple=False).flatten()
-            if dead.numel() and torch.rand((), device=book.device).item() < 0.25:
-                pick = dead[torch.randint(0, dead.numel(), (min(4, dead.numel()),), device=book.device)]
-                src = flat_p[torch.randint(0, flat_p.shape[0], (pick.shape[0],), device=book.device)]
-                book[pick] = src
+        return ce + 0.25 * (commit / n) + book / n, acc
 
 
 class NextConcept(nn.Module):
-    \"\"\"Predicts level k from coarser codes. Positions inside a level do not attend to each other.\"\"\"
+    \"\"\"Predicts one level from the reconstruction so far. Positions in a level are independent.\"\"\"
 
     def __init__(self, vq: MultiScaleResidualVQ, dim: int, n_layer: int, n_head: int):
         super().__init__()
@@ -224,27 +230,22 @@ class NextConcept(nn.Module):
         self.vq = vq
         codebook = vq.codebooks[0].shape[0]
         self.in_proj = nn.Linear(vq.dim, dim)
-        self.pos = nn.ParameterList([nn.Parameter(torch.randn(length, dim) * 0.02) for length in self.levels[1:]])
+        self.pos = nn.ParameterList([nn.Parameter(torch.randn(length, dim) * 0.02) for length in self.levels])
         self.blocks = nn.ModuleList(
             [
                 nn.TransformerEncoderLayer(dim, n_head, dim * 4, dropout=0.0, batch_first=True, norm_first=True, activation="gelu")
                 for _ in range(n_layer)
             ]
         )
-        self.q = nn.Linear(dim, dim)
-        self.k = nn.Linear(dim, dim)
-        self.v = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, codebook)
 
-    def forward_level(self, codes: list[torch.Tensor], level: int) -> torch.Tensor:
-        parts = [self.in_proj(self.vq.codebooks[li][codes[li]]) for li in range(level)]
-        mem = torch.cat(parts, dim=1)
+    def forward_level(self, recon: torch.Tensor, level: int) -> torch.Tensor:
+        pooled, _bins = self.vq._pool(recon, self.levels[level])
+        x = self.in_proj(pooled) + self.pos[level]
         for block in self.blocks:
-            mem = block(mem)
-        query = self.pos[level - 1].unsqueeze(0).expand(mem.shape[0], -1, -1)
-        scale = 1.0 / math.sqrt(query.shape[-1])
-        attn = torch.softmax(self.q(query) @ self.k(mem).transpose(1, 2) * scale, dim=-1)
-        return self.head(query + attn @ self.v(mem))
+            x = block(x)
+        return self.head(self.norm(x))
 
 
 def init_from_teacher(vq: MultiScaleResidualVQ, teacher_embed: torch.Tensor) -> None:
@@ -274,7 +275,7 @@ def generate_ncm(
 ) -> torch.Tensor:
     \"\"\"Draft a window. With a prefix, bins that lie entirely inside it keep the encoded codes.
 
-    The returned tokens start with that prefix. Without one, the coarsest level is drawn from `unigram`.
+    The returned tokens start with that prefix. The coarsest level is predicted from an empty reconstruction.
     \"\"\"
     if prefixes is not None:
         batch = prefixes.shape[0]
@@ -283,16 +284,15 @@ def generate_ncm(
         known_idx = known_mask = None
         if batch is None:
             raise ValueError("pass batch or prefixes")
-    flat = torch.multinomial(unigram, batch * vq.levels[0], replacement=True)
-    level0 = flat.view(batch, vq.levels[0])
-    if known_mask is not None:
-        level0 = torch.where(known_mask[0], known_idx[0], level0)
-    codes = [level0]
-    for li in range(1, len(vq.levels)):
-        pred = gen.forward_level(codes, li).argmax(-1)
+    flat = torch.zeros(batch, vq.levels[-1], vq.dim, device=vq.embed.weight.device, dtype=vq.embed.weight.dtype)
+    recon = flat
+    codes = []
+    for li in range(len(vq.levels)):
+        pred = gen.forward_level(recon, li).argmax(-1)
         if known_mask is not None:
             pred = torch.where(known_mask[li], known_idx[li], pred)
         codes.append(pred)
+        recon = vq.add_level(recon, pred, li)
     tokens = vq.logits_from_codes(codes).argmax(-1)
     if prefixes is not None:
         tokens = tokens.clone()
@@ -447,19 +447,25 @@ md(
     """
 ## Train the hierarchy
 
-Stage 1 is the multiscale residual tokenizer. The codebook is an EMA, not an Adam parameter: AdamW's weight decay was shrinking unused codes toward zero and fighting the EMA. The decoder is tied to the embedding, and the teacher table is projected into that width instead of sliced. Stage 2 freezes the tokenizer and trains the generator. The first 40% of those steps train only the coarse levels, which is the part that has to carry the function prefix. Both stages stay in fp32.
+Stage 1 is the multiscale residual tokenizer from the NCM paper. The decoder is a 2-layer transformer over the running reconstruction. A linear map from a 256-d code cannot name a 152k-word token, which is why the last run topped out at 56% reconstruction. The codebook is trained with the codebook loss and no weight decay. Stage 2 freezes the tokenizer. The generator predicts each level from that running reconstruction, including the coarsest level, whose only input is zeros. The first 40% of generator steps train the coarse levels. Both stages stay in fp32.
 """
 )
 
 code(
     """
 vocab = int(tokenizer.vocab_size)
-vq = MultiScaleResidualVQ(vocab, VQ_DIM, CODEBOOK, LEVELS).to(device)
+vq = MultiScaleResidualVQ(vocab, VQ_DIM, CODEBOOK, LEVELS, n_head=GEN_HEADS).to(device)
 init_from_teacher(vq, teacher_embed)
 del teacher_embed
 print(f"VQ parameters {sum(p.numel() for p in vq.parameters())/1e6:.1f} M, allocated {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
-opt = torch.optim.AdamW([vq.embed.weight], lr=LR)
+decay, plain = [], []
+for name, param in vq.named_parameters():
+    (plain if "codebooks" in name else decay).append(param)
+opt = torch.optim.AdamW(
+    [{"params": decay, "weight_decay": 0.01}, {"params": plain, "weight_decay": 0.0}],
+    lr=LR,
+)
 vq_history = []
 vq.train()
 t0 = time.time()
@@ -474,7 +480,6 @@ for step in range(VQ_STEPS):
     loss.backward()
     torch.nn.utils.clip_grad_norm_(vq.parameters(), 1.0)
     opt.step()
-    vq.ema_update(train[ix])
     if step % 25 == 0 or step == VQ_STEPS - 1:
         vq_history.append((step, loss.item(), acc.item()))
         print(f"[tokenizer] {step:4d}  loss {loss.item():.3f}  acc {acc.item():.3f}  {time.time()-t0:.0f}s", flush=True)
@@ -499,23 +504,28 @@ coarse_hi = max(i for i, length in enumerate(LEVELS) if length <= PREFIX)
 for step in range(GEN_STEPS):
     ix = torch.randint(0, train.shape[0], (GEN_BATCH,), device=device)
     with torch.no_grad():
-        codes = vq.encode(train[ix])
+        codes, recons = vq.contexts(train[ix])
     hi = coarse_hi if step < coarse_until else len(LEVELS) - 1
     loss = torch.zeros((), device=device)
     correct = 0
     total = 0
-    for li in range(1, hi + 1):
-        cond = [c.clone() for c in codes]
-        if torch.rand((), device=device).item() < 0.5:
-            mask = torch.rand_like(cond[li - 1].float()) < 0.1
-            noise = torch.randint(0, CODEBOOK, cond[li - 1].shape, device=device)
-            cond[li - 1] = torch.where(mask, noise, cond[li - 1])
+    n_terms = 0
+    for li in range(hi + 1):
+        cond = recons[li]
+        if li > 0 and torch.rand((), device=device).item() < 0.3:
+            earlier = int(torch.randint(0, li, (), device=device).item())
+            cond = recons[earlier]
+        elif torch.rand((), device=device).item() < 0.5:
+            cond = cond.clone()
+            drop = torch.rand(cond.shape[:2], device=device) < 0.1
+            cond = cond.masked_fill(drop.unsqueeze(-1), 0)
         logits = gen.forward_level(cond, li)
         target = codes[li]
         loss = loss + F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
         correct += (logits.argmax(-1) == target).sum().item()
         total += target.numel()
-    loss = loss / hi
+        n_terms += 1
+    loss = loss / n_terms
     gopt.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_((p for p in gen.parameters() if p.requires_grad), 1.0)
@@ -536,20 +546,25 @@ with torch.no_grad():
         total += batch.numel()
 recon = correct / max(1, total)
 print(f"held-out tokenizer reconstruction {recon:.3f}")
+sample = held[:1]
+with torch.no_grad():
+    trip = vq.logits_from_codes(vq.encode(sample)).argmax(-1)
+print("original  ", tokenizer.decode(sample[0].tolist(), skip_special_tokens=True)[:400])
+print("round trip", tokenizer.decode(trip[0].tolist(), skip_special_tokens=True)[:400])
 per_level = []
 with torch.no_grad():
     probe = held[:64]
-    for li in range(1, len(LEVELS)):
+    for li in range(len(LEVELS)):
         hit = 0
         count = 0
         for start in range(0, probe.shape[0], 4):
             batch = probe[start : start + 4]
-            codes = vq.encode(batch)
-            pred = gen.forward_level(codes, li).argmax(-1)
+            codes, recons = vq.contexts(batch)
+            pred = gen.forward_level(recons[li], li).argmax(-1)
             hit += (pred == codes[li]).sum().item()
             count += codes[li].numel()
         per_level.append(hit / max(1, count))
-print("held-out next-level", " ".join(f"L{i + 1}:{acc:.2f}" for i, acc in enumerate(per_level)))
+print("held-out next-level", " ".join(f"L{i}:{acc:.2f}" for i, acc in enumerate(per_level)))
 print(f"allocated after training {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 """
 )
