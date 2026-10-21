@@ -28,7 +28,7 @@ The method is [Next-Concept Modeling](https://arxiv.org/abs/2610.14162) ([HazyRe
 
 ## What a short run will not do
 
-The lab is a miniature. The Colab notebook is the Qwen-vocabulary training run: 32,768 CodeSearchNet windows, a 4,096-code book, a 4-layer decoder, and an 8-layer generator. A 64-token prefix pins half of every concept level and the model continues the function. A default run is about two hours, with a checkpoint every 1,000 steps. It is still not the paper's training job (billions of tokens). It will not reproduce the LM1B, OpenWebText, or XSum numbers. Judge a run by the round trip and by whether the continuation contains code, not by teacher NLL.
+The lab is a miniature. The Colab notebook is the Qwen-vocabulary training run: 32,768 CodeSearchNet windows, a 4,096-code book, a 4-layer decoder, and an 8-layer generator. A finished checkpoint freezes the tokenizer. Further generator steps weight the coarse continuation 4× and train the finer levels on the model's own sketch. A checkpoint is written every 1,000 steps. It is still not the paper's training job (billions of tokens). It will not reproduce the LM1B, OpenWebText, or XSum numbers. Judge a run by the round trip and by whether the continuation contains code, not by teacher NLL.
 
 Teacher weights stay under their own licenses. The MIT license in this repository covers this code only.
 

@@ -33,7 +33,7 @@ A next-concept model writes a whole level of discrete codes in one forward. The 
 
 The teacher is loaded in fp16, its embedding table is copied, then it is **deleted** before the concept model trains. It is loaded again only for the benchmark. Peak on a 0.5B run stays under 8 GB. A 1.5B run stays under 12 GB.
 
-Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet, in Qwen's own vocabulary. This is the long run: 32,768 windows, a 4,096-code book, a 4-layer decoder, and a concept grid whose coarsest code covers 8 tokens. A 64-token prefix pins half of every level, and the model continues the function from there. Budget about 6,000 tokenizer steps and 8,000 generator steps, on the order of two hours. A checkpoint is written every 1,000 steps to `/content/ncm-hybrid/hybrid.pt`. Rerun the training cell after a disconnect and it resumes if the architecture matches.
+Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet, in Qwen's own vocabulary. A finished checkpoint at `/content/ncm-hybrid/hybrid.pt` or on Drive is reloaded: the tokenizer stays frozen and the generator continues. A fresh run is 6,000 tokenizer steps and 16,000 generator steps. The generator now trains the future coarse codes at 4× the loss of the other levels, and the finer levels are trained on its own coarse sketch as well as the true one. A checkpoint is written every 1,000 steps.
 
 This is still not the paper's training run (billions of tokens, a ~100M generator). Judge it by the round trip and by whether the continuation contains code, not by teacher NLL. A string of `=` can score better than a real function.
 """
@@ -78,11 +78,12 @@ N_TRAIN = 32768
 N_VAL = 512
 PREFIX = 64
 VQ_STEPS = 6000
-GEN_STEPS = 8000
+GEN_STEPS = 16000
 BATCH = 8
 GEN_BATCH = 16
 LR = 3e-4
 TAU = 0.45
+COARSE_LOSS_WEIGHT = 4.0
 SEED = 7
 LOG_EVERY = 100
 OUTPUT = Path("/content/ncm-hybrid")
@@ -469,7 +470,7 @@ md(
     """
 ## Train the hierarchy
 
-Stage 1 is the multiscale residual tokenizer. The decoder is 4 transformer layers over the running reconstruction, the codebook has 4,096 entries, and both the commitment loss and the codebook loss train it. Stage 2 freezes that tokenizer. The generator is 8 layers wide 512. The first level is 16 codes, so each code is 8 tokens, and the 64-token prefix fixes the first half of every level. Loss on the coarsest level is only the future half. The live progress is a bar. A pasteable log line is written every 100 steps, and a checkpoint every 1,000, to `/content/ncm-hybrid/hybrid.pt`. Both stages stay in fp32.
+Stage 1 trains the tokenizer only when no finished checkpoint is loaded. A matching checkpoint freezes those weights. Stage 2 trains the generator. The coarsest future codes are weighted 4×, because that level flattened near 3.5% while the fine levels were still climbing. From the second half of generator training, a level is conditioned on the model's own predicted sketch rather than the true one 85% of the time, which is the reconstruction it will see when it drafts. The live progress is a bar. A pasteable log line every 100 steps includes that coarse accuracy. Checkpoints land in `/content/ncm-hybrid/hybrid.pt` every 1,000 steps. Both stages stay in fp32.
 """
 )
 
@@ -485,6 +486,17 @@ print(f"VQ parameters {sum(p.numel() for p in vq.parameters())/1e6:.1f} M, alloc
 
 OUTPUT.mkdir(parents=True, exist_ok=True)
 ckpt_path = OUTPUT / "hybrid.pt"
+if not ckpt_path.exists():
+    drive_ckpt = Path("/content/drive/MyDrive/ncm-hybrid/hybrid.pt")
+    if not drive_ckpt.exists():
+        try:
+            from google.colab import drive
+            drive.mount("/content/drive")
+        except Exception as exc:
+            print(f"Drive not available ({exc}). A missing local checkpoint starts from the teacher embedding.")
+    if drive_ckpt.exists():
+        ckpt_path.write_bytes(drive_ckpt.read_bytes())
+        print("copied checkpoint from Drive", drive_ckpt)
 resume = None
 if ckpt_path.exists():
     loaded = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -548,25 +560,28 @@ if resume is not None:
     vq_history = list(resume.get("vq_history", []))
 vq.train()
 t0 = time.time()
-tokenizer_bar = tqdm(range(start_vq, VQ_STEPS), desc="tokenizer", initial=start_vq, total=VQ_STEPS, mininterval=1, dynamic_ncols=True)
-for step in tokenizer_bar:
-    ix = torch.randint(0, train.shape[0], (BATCH,), device=device)
-    if step < VQ_STEPS // 3 or torch.rand((), device=device).item() > 0.3:
-        keep = len(LEVELS)
-    else:
-        keep = int(torch.randint(1, len(LEVELS) + 1, ()).item())
-    loss, acc = vq.reconstruction_loss(train[ix], keep)
-    opt.zero_grad(set_to_none=True)
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(vq.parameters(), 1.0)
-    opt.step()
-    tokenizer_bar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{acc.item():.3f}", refresh=False)
-    if step % LOG_EVERY == 0 or step == VQ_STEPS - 1:
-        vq_history.append((step, loss.item(), acc.item()))
-        tqdm.write(f"[tokenizer] {step:4d}  loss {loss.item():.3f}  acc {acc.item():.3f}  {time.time()-t0:.0f}s")
-    if step % 1000 == 999 or step == VQ_STEPS - 1:
-        save_checkpoint(step + 1, 0)
-tokenizer_bar.close()
+if start_vq >= VQ_STEPS:
+    print(f"tokenizer frozen at step {start_vq}")
+else:
+    tokenizer_bar = tqdm(range(start_vq, VQ_STEPS), desc="tokenizer", initial=start_vq, total=VQ_STEPS, mininterval=1, dynamic_ncols=True)
+    for step in tokenizer_bar:
+        ix = torch.randint(0, train.shape[0], (BATCH,), device=device)
+        if step < VQ_STEPS // 3 or torch.rand((), device=device).item() > 0.3:
+            keep = len(LEVELS)
+        else:
+            keep = int(torch.randint(1, len(LEVELS) + 1, ()).item())
+        loss, acc = vq.reconstruction_loss(train[ix], keep)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(vq.parameters(), 1.0)
+        opt.step()
+        tokenizer_bar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{acc.item():.3f}", refresh=False)
+        if step % LOG_EVERY == 0 or step == VQ_STEPS - 1:
+            vq_history.append((step, loss.item(), acc.item()))
+            tqdm.write(f"[tokenizer] {step:4d}  loss {loss.item():.3f}  acc {acc.item():.3f}  {time.time()-t0:.0f}s")
+        if step % 1000 == 999 or step == VQ_STEPS - 1:
+            save_checkpoint(step + 1, 0)
+    tokenizer_bar.close()
 
 for p in vq.parameters():
     p.requires_grad_(False)
@@ -601,33 +616,50 @@ for step in concept_bar:
     with torch.no_grad():
         codes, recons = vq.contexts(train[ix])
         prefix_embed = vq.embed(train[ix][:, :PREFIX])
+        known_idx, known_mask = _prefix_codes(vq, train[ix][:, :PREFIX])
     hi = coarse_hi if step < coarse_until else len(LEVELS) - 1
+    # Own sketch, as in generation: predicted codes, true codes inside the prefix.
+    # Finer levels see this instead of the true sketch once training is underway.
+    own = torch.zeros_like(recons[0])
+    ss = min(0.85, 0.25 + 0.75 * (step / max(1, GEN_STEPS - 1)))
     loss = torch.zeros((), device=device)
+    weight_sum = 0.0
     correct = 0
     total = 0
-    n_terms = 0
+    coarse_hit = 0
+    coarse_count = 0
     for li in range(hi + 1):
-        cond = recons[li]
         target = codes[li]
         if li == 0:
             cond = torch.zeros_like(recons[0])
             cond[:, :PREFIX] = prefix_embed
-            target = target[:, coarse_future]
-        elif torch.rand((), device=device).item() < 0.3:
-            earlier = int(torch.randint(0, li, (), device=device).item())
-            cond = recons[earlier]
-        elif torch.rand((), device=device).item() < 0.5:
-            cond = cond.clone()
-            drop = torch.rand(cond.shape[:2], device=device) < 0.1
-            cond = cond.masked_fill(drop.unsqueeze(-1), 0)
+        elif torch.rand((), device=device).item() < ss:
+            cond = own
+        else:
+            cond = recons[li]
         logits = gen.forward_level(cond, li)
         if li == 0:
-            logits = logits[:, coarse_future]
-        loss = loss + F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
-        correct += (logits.argmax(-1) == target).sum().item()
-        total += target.numel()
-        n_terms += 1
-    loss = loss / n_terms
+            logits_l = logits[:, coarse_future]
+            target_l = target[:, coarse_future]
+            weight = COARSE_LOSS_WEIGHT
+        else:
+            logits_l = logits
+            target_l = target
+            weight = 1.0
+        loss = loss + weight * F.cross_entropy(
+            logits_l.reshape(-1, logits_l.size(-1)), target_l.reshape(-1)
+        )
+        weight_sum += weight
+        hit = (logits_l.argmax(-1) == target_l).sum().item()
+        correct += hit
+        total += target_l.numel()
+        if li == 0:
+            coarse_hit += hit
+            coarse_count += target_l.numel()
+        pred = logits.argmax(-1).detach()
+        pred = torch.where(known_mask[li], known_idx[li], pred)
+        own = vq.add_level(own, pred, li)
+    loss = loss / weight_sum
     gopt.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_((p for p in gen.parameters() if p.requires_grad), 1.0)
@@ -635,9 +667,13 @@ for step in concept_bar:
     concept_bar.set_postfix(loss=f"{loss.item():.3f}", refresh=False)
     if step % LOG_EVERY == 0 or step == GEN_STEPS - 1:
         acc = correct / max(1, total)
+        coarse_acc = coarse_hit / max(1, coarse_count)
         gen_history.append((step, loss.item(), acc))
-        concept_bar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{acc:.3f}", refresh=False)
-        tqdm.write(f"[concepts]  {step:4d}  loss {loss.item():.3f}  acc {acc:.3f}  {time.time()-t1:.0f}s")
+        concept_bar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{acc:.3f}", coarse=f"{coarse_acc:.3f}", refresh=False)
+        tqdm.write(
+            f"[concepts]  {step:4d}  loss {loss.item():.3f}  acc {acc:.3f}  "
+            f"coarse {coarse_acc:.3f}  {time.time()-t1:.0f}s"
+        )
     if step % 1000 == 999 or step == GEN_STEPS - 1:
         save_checkpoint(VQ_STEPS, step + 1, gen, unigram)
 concept_bar.close()
