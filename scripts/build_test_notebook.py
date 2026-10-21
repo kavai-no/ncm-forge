@@ -54,6 +54,9 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 CHECKPOINT_CANDIDATES = [
     Path("/content/ncm-hybrid/hybrid.pt"),
@@ -180,6 +183,7 @@ def code_windows(split: str, limit: int, seed: int) -> torch.Tensor:
     need = limit * context
     ids: list[int] = []
     kept = 0
+    bar = tqdm(total=limit, desc=f"{split} windows", unit="win", mininterval=1, dynamic_ncols=True)
     for row in ds:
         text = (row.get("whole_func_string") or "").replace("\\r\\n", "\\n").strip()
         if len(text) < 40 or "def " not in text:
@@ -189,8 +193,12 @@ def code_windows(split: str, limit: int, seed: int) -> torch.Tensor:
             continue
         ids.extend(piece)
         kept += 1
+        bar.n = min(limit, len(ids) // context)
+        bar.set_postfix(functions=kept, refresh=False)
+        bar.refresh()
         if len(ids) >= need + context:
             break
+    bar.close()
     usable = (len(ids) // context) * context
     if usable < need:
         raise SystemExit(f"{split} produced {usable // context} windows, need {limit}.")

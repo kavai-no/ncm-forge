@@ -49,12 +49,16 @@ code(
     """
 import gc
 import math
+import os
 import time
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Free Colab T4. Do not point this at a 7B checkpoint.
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -80,6 +84,7 @@ GEN_BATCH = 16
 LR = 3e-4
 TAU = 0.45
 SEED = 7
+LOG_EVERY = 100
 OUTPUT = Path("/content/ncm-hybrid")
 
 # CodeSearchNet Python. Public, no HF gate. Train / validation / test are
@@ -385,6 +390,8 @@ code(
     """
 import os
 
+from tqdm.auto import tqdm
+
 try:
     from google.colab import userdata
     token = userdata.get("HF_TOKEN")
@@ -414,6 +421,7 @@ def code_windows(split: str, limit: int, seed: int) -> torch.Tensor:
     need = limit * CONTEXT
     ids: list[int] = []
     kept = 0
+    bar = tqdm(total=limit, desc=f"{split} windows", unit="win", mininterval=1, dynamic_ncols=True)
     for row in ds:
         text = (row.get("whole_func_string") or "").replace("\\r\\n", "\\n").strip()
         if len(text) < 40 or "def " not in text:
@@ -423,10 +431,12 @@ def code_windows(split: str, limit: int, seed: int) -> torch.Tensor:
             continue
         ids.extend(piece)
         kept += 1
-        if kept % 500 == 0:
-            print(f"{split}: {kept} functions, {len(ids) // CONTEXT} windows", flush=True)
+        bar.n = min(limit, len(ids) // CONTEXT)
+        bar.set_postfix(functions=kept, refresh=False)
+        bar.refresh()
         if len(ids) >= need + CONTEXT:
             break
+    bar.close()
     usable = (len(ids) // CONTEXT) * CONTEXT
     if usable < need:
         raise SystemExit(
@@ -459,13 +469,15 @@ md(
     """
 ## Train the hierarchy
 
-Stage 1 is the multiscale residual tokenizer. The decoder is 4 transformer layers over the running reconstruction, the codebook has 4,096 entries, and both the commitment loss and the codebook loss train it. Stage 2 freezes that tokenizer. The generator is 8 layers wide 512. The first level is 16 codes, so each code is 8 tokens, and the 64-token prefix fixes the first half of every level. Loss on the coarsest level is only the future half. Checkpoints land in `/content/ncm-hybrid/hybrid.pt` every 1,000 steps. Both stages stay in fp32.
+Stage 1 is the multiscale residual tokenizer. The decoder is 4 transformer layers over the running reconstruction, the codebook has 4,096 entries, and both the commitment loss and the codebook loss train it. Stage 2 freezes that tokenizer. The generator is 8 layers wide 512. The first level is 16 codes, so each code is 8 tokens, and the 64-token prefix fixes the first half of every level. Loss on the coarsest level is only the future half. The live progress is a bar. A pasteable log line is written every 100 steps, and a checkpoint every 1,000, to `/content/ncm-hybrid/hybrid.pt`. Both stages stay in fp32.
 """
 )
 
 code(
     """
 vocab = int(tokenizer.vocab_size)
+from tqdm.auto import tqdm
+
 vq = MultiScaleResidualVQ(vocab, VQ_DIM, CODEBOOK, LEVELS, n_dec=DEC_LAYERS, n_head=GEN_HEADS).to(device)
 init_from_teacher(vq, teacher_embed)
 del teacher_embed
@@ -517,7 +529,7 @@ def save_checkpoint(vq_step, gen_step, generator=None, prior=None):
         payload["generator"] = generator.state_dict()
         payload["unigram"] = prior.detach().cpu()
     torch.save(payload, ckpt_path)
-    print(f"saved {ckpt_path}  tokenizer {vq_step}  generator {gen_step}", flush=True)
+    tqdm.write(f"saved {ckpt_path}  tokenizer {vq_step}  generator {gen_step}")
 
 
 decay, plain = [], []
@@ -536,7 +548,8 @@ if resume is not None:
     vq_history = list(resume.get("vq_history", []))
 vq.train()
 t0 = time.time()
-for step in range(start_vq, VQ_STEPS):
+tokenizer_bar = tqdm(range(start_vq, VQ_STEPS), desc="tokenizer", initial=start_vq, total=VQ_STEPS, mininterval=1, dynamic_ncols=True)
+for step in tokenizer_bar:
     ix = torch.randint(0, train.shape[0], (BATCH,), device=device)
     if step < VQ_STEPS // 3 or torch.rand((), device=device).item() > 0.3:
         keep = len(LEVELS)
@@ -547,11 +560,13 @@ for step in range(start_vq, VQ_STEPS):
     loss.backward()
     torch.nn.utils.clip_grad_norm_(vq.parameters(), 1.0)
     opt.step()
-    if step % 25 == 0 or step == VQ_STEPS - 1:
+    tokenizer_bar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{acc.item():.3f}", refresh=False)
+    if step % LOG_EVERY == 0 or step == VQ_STEPS - 1:
         vq_history.append((step, loss.item(), acc.item()))
-        print(f"[tokenizer] {step:4d}  loss {loss.item():.3f}  acc {acc.item():.3f}  {time.time()-t0:.0f}s", flush=True)
+        tqdm.write(f"[tokenizer] {step:4d}  loss {loss.item():.3f}  acc {acc.item():.3f}  {time.time()-t0:.0f}s")
     if step % 1000 == 999 or step == VQ_STEPS - 1:
         save_checkpoint(step + 1, 0)
+tokenizer_bar.close()
 
 for p in vq.parameters():
     p.requires_grad_(False)
@@ -559,7 +574,9 @@ vq.eval()
 
 with torch.no_grad():
     prior_rows = train[:4096]
-    chunks = [vq.encode(prior_rows[i : i + 16])[0].reshape(-1) for i in range(0, prior_rows.shape[0], 16)]
+    chunks = []
+    for i in tqdm(range(0, prior_rows.shape[0], 16), desc="coarse prior", mininterval=1, dynamic_ncols=True):
+        chunks.append(vq.encode(prior_rows[i : i + 16])[0].reshape(-1))
     counts = torch.bincount(torch.cat(chunks), minlength=CODEBOOK).float()
 unigram = (counts + 0.1) / (counts + 0.1).sum()
 unigram = unigram.to(device)
@@ -578,7 +595,8 @@ coarse_hi = max(i for i, length in enumerate(LEVELS) if length <= PREFIX)
 coarse_future = [i for i, (start, _end) in enumerate(vq._bins(CONTEXT, LEVELS[0])) if start >= PREFIX]
 if not coarse_future:
     raise RuntimeError("PREFIX covers every coarsest bin, so there is nothing to continue")
-for step in range(start_gen, GEN_STEPS):
+concept_bar = tqdm(range(start_gen, GEN_STEPS), desc="concepts", initial=start_gen, total=GEN_STEPS, mininterval=1, dynamic_ncols=True)
+for step in concept_bar:
     ix = torch.randint(0, train.shape[0], (GEN_BATCH,), device=device)
     with torch.no_grad():
         codes, recons = vq.contexts(train[ix])
@@ -614,18 +632,21 @@ for step in range(start_gen, GEN_STEPS):
     loss.backward()
     torch.nn.utils.clip_grad_norm_((p for p in gen.parameters() if p.requires_grad), 1.0)
     gopt.step()
-    if step % 25 == 0 or step == GEN_STEPS - 1:
+    concept_bar.set_postfix(loss=f"{loss.item():.3f}", refresh=False)
+    if step % LOG_EVERY == 0 or step == GEN_STEPS - 1:
         acc = correct / max(1, total)
         gen_history.append((step, loss.item(), acc))
-        print(f"[concepts]  {step:4d}  loss {loss.item():.3f}  acc {acc:.3f}  {time.time()-t1:.0f}s", flush=True)
+        concept_bar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{acc:.3f}", refresh=False)
+        tqdm.write(f"[concepts]  {step:4d}  loss {loss.item():.3f}  acc {acc:.3f}  {time.time()-t1:.0f}s")
     if step % 1000 == 999 or step == GEN_STEPS - 1:
         save_checkpoint(VQ_STEPS, step + 1, gen, unigram)
+concept_bar.close()
 
 gen.eval()
 correct = 0
 total = 0
 with torch.no_grad():
-    for start in range(0, held.shape[0], 4):
+    for start in tqdm(range(0, held.shape[0], 4), desc="held-out reconstruction", mininterval=1, dynamic_ncols=True):
         batch = held[start : start + 4]
         pred = vq.logits_from_codes(vq.encode(batch)).argmax(-1)
         correct += (pred == batch).sum().item()
