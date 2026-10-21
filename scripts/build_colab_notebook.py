@@ -473,8 +473,15 @@ for step in range(GEN_STEPS):
         print(f"[concepts]  {step:4d}  loss {loss.item():.3f}  acc {acc:.3f}  {time.time()-t1:.0f}s", flush=True)
 
 gen.eval()
+correct = 0
+total = 0
 with torch.no_grad():
-    recon = (vq.logits_from_codes(vq.encode(held)).argmax(-1) == held).float().mean().item()
+    for start in range(0, held.shape[0], 4):
+        batch = held[start : start + 4]
+        pred = vq.logits_from_codes(vq.encode(batch)).argmax(-1)
+        correct += (pred == batch).sum().item()
+        total += batch.numel()
+recon = correct / max(1, total)
 print(f"held-out tokenizer reconstruction {recon:.3f}")
 print(f"allocated after training {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 """
