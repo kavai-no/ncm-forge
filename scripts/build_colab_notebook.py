@@ -273,9 +273,10 @@ def generate_ncm(
     batch: int | None = None,
     prefixes: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    \"\"\"Draft a window. With a prefix, bins that lie entirely inside it keep the encoded codes.
+    \"\"\"Draft a window. Bins inside the prefix keep their encoded codes.
 
-    The returned tokens start with that prefix. The coarsest level is predicted from an empty reconstruction.
+    The returned tokens start with that prefix. The coarsest level sees the prefix
+    embedding, so the future codes are a continuation rather than an unconditional draw.
     \"\"\"
     if prefixes is not None:
         batch = prefixes.shape[0]
@@ -284,11 +285,14 @@ def generate_ncm(
         known_idx = known_mask = None
         if batch is None:
             raise ValueError("pass batch or prefixes")
-    flat = torch.zeros(batch, vq.levels[-1], vq.dim, device=vq.embed.weight.device, dtype=vq.embed.weight.dtype)
-    recon = flat
+    recon = torch.zeros(batch, vq.levels[-1], vq.dim, device=vq.embed.weight.device, dtype=vq.embed.weight.dtype)
     codes = []
     for li in range(len(vq.levels)):
-        pred = gen.forward_level(recon, li).argmax(-1)
+        cond = recon
+        if prefixes is not None and li == 0:
+            cond = recon.clone()
+            cond[:, : prefixes.shape[1]] = vq.embed(prefixes)
+        pred = gen.forward_level(cond, li).argmax(-1)
         if known_mask is not None:
             pred = torch.where(known_mask[li], known_idx[li], pred)
         codes.append(pred)
@@ -447,7 +451,7 @@ md(
     """
 ## Train the hierarchy
 
-Stage 1 is the multiscale residual tokenizer from the NCM paper. The decoder is a 2-layer transformer over the running reconstruction. A linear map from a 256-d code cannot name a 152k-word token, which is why the last run topped out at 56% reconstruction. The codebook is trained with the codebook loss and no weight decay. Stage 2 freezes the tokenizer. The generator predicts each level from that running reconstruction, including the coarsest level, whose only input is zeros. The first 40% of generator steps train the coarse levels. Both stages stay in fp32.
+Stage 1 is the multiscale residual tokenizer from the NCM paper. The decoder is a 2-layer transformer over the running reconstruction. A linear map from a 256-d code cannot name a 152k-word token, which is why the last run topped out at 56% reconstruction. The codebook is trained with the codebook loss and no weight decay. Stage 2 freezes the tokenizer. Each finer level is predicted from the reconstruction so far. The coarsest level has nothing coarser to look at, so it now reads the function prefix itself. The previous run predicted that level from zeros and only pasted the prefix onto the finished draft, which is why the continuation was generic Python (`self`, quotes, `to`) instead of the rest of the function. The first 40% of generator steps train the coarse levels. Both stages stay in fp32.
 """
 )
 
@@ -501,10 +505,14 @@ gen.train()
 t1 = time.time()
 coarse_until = int(GEN_STEPS * 0.4)
 coarse_hi = max(i for i, length in enumerate(LEVELS) if length <= PREFIX)
+coarse_future = [i for i, (start, _end) in enumerate(vq._bins(CONTEXT, LEVELS[0])) if start >= PREFIX]
+if not coarse_future:
+    raise RuntimeError("PREFIX covers every coarsest bin, so there is nothing to continue")
 for step in range(GEN_STEPS):
     ix = torch.randint(0, train.shape[0], (GEN_BATCH,), device=device)
     with torch.no_grad():
         codes, recons = vq.contexts(train[ix])
+        prefix_embed = vq.embed(train[ix][:, :PREFIX])
     hi = coarse_hi if step < coarse_until else len(LEVELS) - 1
     loss = torch.zeros((), device=device)
     correct = 0
@@ -512,7 +520,12 @@ for step in range(GEN_STEPS):
     n_terms = 0
     for li in range(hi + 1):
         cond = recons[li]
-        if li > 0 and torch.rand((), device=device).item() < 0.3:
+        target = codes[li]
+        if li == 0:
+            cond = torch.zeros_like(recons[0])
+            cond[:, :PREFIX] = prefix_embed
+            target = target[:, coarse_future]
+        elif torch.rand((), device=device).item() < 0.3:
             earlier = int(torch.randint(0, li, (), device=device).item())
             cond = recons[earlier]
         elif torch.rand((), device=device).item() < 0.5:
@@ -520,7 +533,8 @@ for step in range(GEN_STEPS):
             drop = torch.rand(cond.shape[:2], device=device) < 0.1
             cond = cond.masked_fill(drop.unsqueeze(-1), 0)
         logits = gen.forward_level(cond, li)
-        target = codes[li]
+        if li == 0:
+            logits = logits[:, coarse_future]
         loss = loss + F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
         correct += (logits.argmax(-1) == target).sum().item()
         total += target.numel()
@@ -565,6 +579,19 @@ with torch.no_grad():
             count += codes[li].numel()
         per_level.append(hit / max(1, count))
 print("held-out next-level", " ".join(f"L{i}:{acc:.2f}" for i, acc in enumerate(per_level)))
+hit = count = 0
+with torch.no_grad():
+    bins = vq._bins(CONTEXT, LEVELS[0])
+    fut = [i for i, (start, _end) in enumerate(bins) if start >= PREFIX]
+    for start in range(0, probe.shape[0], 4):
+        batch = probe[start : start + 4]
+        codes = vq.encode(batch)
+        cond = torch.zeros(batch.shape[0], batch.shape[1], vq.dim, device=batch.device)
+        cond[:, :PREFIX] = vq.embed(batch[:, :PREFIX])
+        pred = gen.forward_level(cond, 0).argmax(-1)
+        hit += (pred[:, fut] == codes[0][:, fut]).sum().item()
+        count += codes[0][:, fut].numel()
+print(f"held-out coarsest continuation {hit / max(1, count):.3f}  (future codes, given the prefix)")
 print(f"allocated after training {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 """
 )
@@ -706,15 +733,20 @@ print("wrote", OUTPUT / "hybrid.pt")
 
 code(
     """
-# Optional. Run only if you want the checkpoint after this runtime is gone.
+# Optional. The checkpoint is already at OUTPUT / "hybrid.pt". Drive is only a copy.
 from google.colab import drive
 
-drive.mount("/content/drive")
-dest = Path("/content/drive/MyDrive/ncm-hybrid")
-dest.mkdir(parents=True, exist_ok=True)
-target = dest / "hybrid.pt"
-target.write_bytes((OUTPUT / "hybrid.pt").read_bytes())
-print("copied to", target)
+try:
+    drive.mount("/content/drive")
+    dest = Path("/content/drive/MyDrive/ncm-hybrid")
+    dest.mkdir(parents=True, exist_ok=True)
+    target = dest / "hybrid.pt"
+    target.write_bytes((OUTPUT / "hybrid.pt").read_bytes())
+    print("copied to", target)
+except Exception as exc:
+    print("Drive copy failed:", exc)
+    print("The checkpoint is still at", OUTPUT / "hybrid.pt")
+    print("Download that file from the Colab file browser before the runtime is deleted.")
 """
 )
 
