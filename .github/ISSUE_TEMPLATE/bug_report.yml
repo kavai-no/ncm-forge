@@ -1,0 +1,33 @@
+name: Bug
+description: Something in the lab, the trainer, or a notebook is wrong.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where
+      options:
+        - Browser lab
+        - Train notebook
+        - Test notebook
+        - Exported Python trainer
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Teacher model
+      placeholder: Qwen/Qwen2.5-0.5B-Instruct

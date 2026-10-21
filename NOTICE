@@ -1,0 +1,15 @@
+NCM Forge
+Copyright (c) 2026 kavai.no
+
+This project is licensed under the MIT License. See LICENSE.
+
+The method is the one in HazyResearch/ncm (https://github.com/HazyResearch/ncm,
+arXiv:2610.14162). That repository is MIT licensed, with no extra field-of-use
+or noncommercial restriction. Its LICENSE names:
+
+Copyright (c) 2026 Hermann Kumbong, Ishan S. Khare, Iddah Mlauzi, Andrew Woen,
+Charles Ding, E. Kelly Buchanan, Simran Arora, Azalia Mirhoseini, Christopher Ré
+
+This repository does not include their source. Their copyright stays on their
+code. Use, modification, and redistribution of this project follow the MIT
+terms above, which is as permissive as that license allows.

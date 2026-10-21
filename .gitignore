@@ -1,0 +1,27 @@
+# dependencies and build
+node_modules/
+dist/
+.output/
+.nitro/
+.vercel/
+coverage/
+
+# secrets and local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# logs and caches
+*.log
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# local agent workspace, not part of the published project
+.grok/
+AGENTS.md
+
