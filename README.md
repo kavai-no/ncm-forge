@@ -28,7 +28,7 @@ The method is [Next-Concept Modeling](https://arxiv.org/abs/2610.14162) ([HazyRe
 
 ## What a short run will not do
 
-The lab is a miniature. A default Colab run is a few hundred steps, not a paper-scale training job. It can show whether reconstruction, next-level codes, and the repair rule are working. It will not reproduce the LM1B, OpenWebText, or XSum numbers in the paper. The test notebook says so when a short run misses a check.
+The lab is a miniature. A default Colab run is about 1,500 steps on each stage, not a paper-scale training job. It can show whether reconstruction, next-level codes, and the repair rule are working. It will not reproduce the LM1B, OpenWebText, or XSum numbers in the paper. The test notebook says so when a short run misses a check.
 
 Teacher weights stay under their own licenses. The MIT license in this repository covers this code only.
 

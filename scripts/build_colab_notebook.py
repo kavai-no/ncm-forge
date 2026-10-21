@@ -33,7 +33,7 @@ A next-concept model writes a whole level of discrete codes in one forward. The 
 
 The teacher is loaded in fp16, its embedding table is copied, then it is **deleted** before the concept model trains. It is loaded again only for the benchmark. Peak on a 0.5B run stays under 8 GB. A 1.5B run stays under 12 GB.
 
-Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet (real GitHub functions, split by repository), not a list of prompts and not Wikipedia. A default run uses a few thousand windows and a few hundred steps, on the order of 15–25 minutes. It does not see the whole corpus, and it will not learn to write a working program.
+Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet (real GitHub functions, split by repository). A default run is about 1,500 steps on the tokenizer and 1,500 on the generator, on the order of 30–40 minutes. It does not see the whole corpus, and it will not learn to write a working program. The draft continues the same function prefix the teacher sees. A draft that ignores that prefix collapses to commas and spaces, which is what a short unconditional run produces.
 """
 )
 
@@ -58,7 +58,7 @@ import torch.nn.functional as F
 MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
 CONTEXT = 128
-LEVELS = [1, 8, 16, 24, 32, 40, 52, 64, 76, 92, 108, 128]
+LEVELS = [4, 8, 16, 32, 48, 64, 80, 96, 112, 128]
 CODEBOOK = 2048
 VQ_DIM = 256
 GEN_DIM = 384
@@ -67,9 +67,10 @@ GEN_HEADS = 6
 N_TRAIN = 4096
 N_VAL = 256
 PREFIX = 32
-VQ_STEPS = 500
-GEN_STEPS = 700
+VQ_STEPS = 1500
+GEN_STEPS = 1500
 BATCH = 8
+GEN_BATCH = 16
 LR = 3e-4
 TAU = 0.45
 SEED = 7
@@ -122,15 +123,11 @@ class MultiScaleResidualVQ(nn.Module):
         self.dim = dim
         self.embed = nn.Embedding(vocab, dim)
         self.codebooks = nn.ParameterList(
-            [nn.Parameter(torch.randn(codebook, dim) * (0.02 if i < len(levels) - 1 else 0.2)) for i in range(len(levels))]
+            [nn.Parameter(torch.randn(codebook, dim) * 0.02) for _ in range(len(levels))]
         )
         self.dec = nn.Linear(dim, vocab, bias=False)
+        self.dec.weight = self.embed.weight
         nn.init.normal_(self.embed.weight, std=0.02)
-        with torch.no_grad():
-            last = self.codebooks[-1]
-            n = min(vocab, last.shape[0])
-            last[:n].copy_(self.embed.weight[:n])
-            self.dec.weight.copy_(self.embed.weight)
 
     def _bins(self, t: int, length: int) -> list[tuple[int, int]]:
         bins = []
@@ -256,40 +253,93 @@ def init_from_teacher(vq: MultiScaleResidualVQ, teacher_embed: torch.Tensor) -> 
         rows = min(vq.embed.weight.shape[0], src.shape[0])
         if src.shape[1] == vq.dim:
             copied = src[:rows]
-        elif src.shape[1] > vq.dim:
-            copied = src[:rows, : vq.dim]
         else:
-            copied = F.pad(src[:rows], (0, vq.dim - src.shape[1]))
+            # First 256 coordinates of an 896-d table are not a projection.
+            gen = torch.Generator().manual_seed(0)
+            proj = torch.randn(src.shape[1], vq.dim, generator=gen) / math.sqrt(src.shape[1])
+            copied = src[:rows] @ proj
         vq.embed.weight[:rows].copy_(copied)
-        n = min(rows, vq.codebooks[-1].shape[0])
-        vq.codebooks[-1][:n].copy_(vq.embed.weight[:n])
-        vq.dec.weight[:rows].copy_(vq.embed.weight[:rows])
+        for book in vq.codebooks:
+            pick = torch.randint(0, rows, (book.shape[0],))
+            book.copy_(vq.embed.weight[pick])
 
 
 @torch.no_grad()
-def generate_ncm(gen: NextConcept, vq: MultiScaleResidualVQ, unigram: torch.Tensor, batch: int) -> torch.Tensor:
-    level0 = torch.multinomial(unigram, batch, replacement=True).view(batch, 1)
+def generate_ncm(
+    gen: NextConcept,
+    vq: MultiScaleResidualVQ,
+    unigram: torch.Tensor,
+    batch: int | None = None,
+    prefixes: torch.Tensor | None = None,
+) -> torch.Tensor:
+    \"\"\"Draft a window. With a prefix, bins that lie entirely inside it keep the encoded codes.
+
+    The returned tokens start with that prefix. Without one, the coarsest level is drawn from `unigram`.
+    \"\"\"
+    if prefixes is not None:
+        batch = prefixes.shape[0]
+        known_idx, known_mask = _prefix_codes(vq, prefixes)
+    else:
+        known_idx = known_mask = None
+        if batch is None:
+            raise ValueError("pass batch or prefixes")
+    flat = torch.multinomial(unigram, batch * vq.levels[0], replacement=True)
+    level0 = flat.view(batch, vq.levels[0])
+    if known_mask is not None:
+        level0 = torch.where(known_mask[0], known_idx[0], level0)
     codes = [level0]
     for li in range(1, len(vq.levels)):
-        codes.append(gen.forward_level(codes, li).argmax(-1))
-    return vq.logits_from_codes(codes).argmax(-1)
+        pred = gen.forward_level(codes, li).argmax(-1)
+        if known_mask is not None:
+            pred = torch.where(known_mask[li], known_idx[li], pred)
+        codes.append(pred)
+    tokens = vq.logits_from_codes(codes).argmax(-1)
+    if prefixes is not None:
+        tokens = tokens.clone()
+        tokens[:, : prefixes.shape[1]] = prefixes
+    return tokens
 
 
 @torch.no_grad()
-def hybrid_repair(draft: torch.Tensor, teacher, tau: float) -> tuple[torch.Tensor, float]:
+def _prefix_codes(vq: MultiScaleResidualVQ, prefixes: torch.Tensor):
+    residual = vq.embed(prefixes)
+    known_idx = []
+    known_mask = []
+    p = prefixes.shape[1]
+    for li, length in enumerate(vq.levels):
+        bins = vq._bins(vq.levels[-1], length)
+        idx = torch.zeros(prefixes.shape[0], length, dtype=torch.long, device=prefixes.device)
+        mask = torch.zeros(prefixes.shape[0], length, dtype=torch.bool, device=prefixes.device)
+        for i, (start, end) in enumerate(bins):
+            if end <= p and end > start:
+                code, q = vq.quantize(residual[:, start:end].mean(dim=1, keepdim=True), li)
+                idx[:, i] = code[:, 0]
+                mask[:, i] = True
+                residual[:, start:end] = residual[:, start:end] - q
+        known_idx.append(idx)
+        known_mask.append(mask)
+    return known_idx, known_mask
+
+
+@torch.no_grad()
+def hybrid_repair(draft: torch.Tensor, teacher, tau: float, prefix: int = 0) -> tuple[torch.Tensor, float]:
     \"\"\"One causal teacher forward. Low-confidence draft tokens take the teacher's prediction.
 
     Logits at position t-1 predict token t, so a replacement does not re-enter this forward.
-    Forwards: len(levels) from the concept model, plus this one.
+    Tokens inside `prefix` are the given function start and are not rewritten.
+    The rate is the fraction rewritten in the continuation.
     \"\"\"
     logits = teacher(draft).logits
     pred = logits.argmax(-1)
     probs = logits.softmax(-1)
     conf = probs[:, :-1].gather(-1, draft[:, 1:].unsqueeze(-1)).squeeze(-1)
     replace = conf < tau
+    if prefix > 1:
+        replace[:, : prefix - 1] = False
     hybrid = draft.clone()
     hybrid[:, 1:] = torch.where(replace, pred[:, :-1], draft[:, 1:])
-    return hybrid, replace.float().mean().item()
+    tail = replace if prefix <= 1 else replace[:, prefix - 1 :]
+    return hybrid, tail.float().mean().item()
 
 
 def teacher_nll(teacher, tokens: torch.Tensor) -> float:
@@ -397,7 +447,7 @@ md(
     """
 ## Train the hierarchy
 
-Stage 1 is the multiscale residual tokenizer. Stage 2 freezes it and trains the next-concept generator. Both stay in fp32. They are small next to the teacher. The first third of tokenizer steps always keep every level, so the fine codes learn token identity before coarse levels are asked to reconstruct on their own.
+Stage 1 is the multiscale residual tokenizer. The codebook is an EMA, not an Adam parameter: AdamW's weight decay was shrinking unused codes toward zero and fighting the EMA. The decoder is tied to the embedding, and the teacher table is projected into that width instead of sliced. Stage 2 freezes the tokenizer and trains the generator. The first 40% of those steps train only the coarse levels, which is the part that has to carry the function prefix. Both stages stay in fp32.
 """
 )
 
@@ -409,7 +459,7 @@ init_from_teacher(vq, teacher_embed)
 del teacher_embed
 print(f"VQ parameters {sum(p.numel() for p in vq.parameters())/1e6:.1f} M, allocated {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
-opt = torch.optim.AdamW(vq.parameters(), lr=LR)
+opt = torch.optim.AdamW([vq.embed.weight], lr=LR)
 vq_history = []
 vq.train()
 t0 = time.time()
@@ -444,14 +494,17 @@ gopt = torch.optim.AdamW((p for p in gen.parameters() if p.requires_grad), lr=LR
 gen_history = []
 gen.train()
 t1 = time.time()
+coarse_until = int(GEN_STEPS * 0.4)
+coarse_hi = max(i for i, length in enumerate(LEVELS) if length <= PREFIX)
 for step in range(GEN_STEPS):
-    ix = torch.randint(0, train.shape[0], (BATCH,), device=device)
+    ix = torch.randint(0, train.shape[0], (GEN_BATCH,), device=device)
     with torch.no_grad():
         codes = vq.encode(train[ix])
+    hi = coarse_hi if step < coarse_until else len(LEVELS) - 1
     loss = torch.zeros((), device=device)
     correct = 0
     total = 0
-    for li in range(1, len(LEVELS)):
+    for li in range(1, hi + 1):
         cond = [c.clone() for c in codes]
         if torch.rand((), device=device).item() < 0.5:
             mask = torch.rand_like(cond[li - 1].float()) < 0.1
@@ -462,7 +515,7 @@ for step in range(GEN_STEPS):
         loss = loss + F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
         correct += (logits.argmax(-1) == target).sum().item()
         total += target.numel()
-    loss = loss / (len(LEVELS) - 1)
+    loss = loss / hi
     gopt.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_((p for p in gen.parameters() if p.requires_grad), 1.0)
@@ -483,6 +536,20 @@ with torch.no_grad():
         total += batch.numel()
 recon = correct / max(1, total)
 print(f"held-out tokenizer reconstruction {recon:.3f}")
+per_level = []
+with torch.no_grad():
+    probe = held[:64]
+    for li in range(1, len(LEVELS)):
+        hit = 0
+        count = 0
+        for start in range(0, probe.shape[0], 4):
+            batch = probe[start : start + 4]
+            codes = vq.encode(batch)
+            pred = gen.forward_level(codes, li).argmax(-1)
+            hit += (pred == codes[li]).sum().item()
+            count += codes[li].numel()
+        per_level.append(hit / max(1, count))
+print("held-out next-level", " ".join(f"L{i + 1}:{acc:.2f}" for i, acc in enumerate(per_level)))
 print(f"allocated after training {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 """
 )
@@ -491,13 +558,13 @@ md(
     """
 ## Benchmark the hybrid
 
-Three writers, same length:
+Three writers, same 128 tokens, same function prefix:
 
-- **Teacher** continues the first `PREFIX` tokens of a validation window, which is the start or middle of a real function. One forward per new token.
-- **Next-concept** drafts a full window from the coarsest code. One forward per level. It is not shown that prefix.
-- **Hybrid** is that draft plus one teacher forward, which replaces tokens the teacher assigns probability below `TAU`.
+- **Teacher** continues the first `PREFIX` tokens of a validation window. One forward per new token.
+- **Next-concept** encodes the bins that sit entirely inside that prefix, predicts the rest coarse-to-fine, and decodes. One forward per level.
+- **Hybrid** is that draft plus one teacher forward. Tokens inside the prefix stay. Elsewhere, a token the teacher assigns probability below `TAU` is replaced. The replacement does not re-enter that forward, so a comma draft cannot be turned into a function by the repair alone.
 
-Quality is the teacher's negative log-likelihood of each writer (lower is closer to the teacher). Repair rate is the fraction of tokens the teacher actually changed. Read the decoded text. A short run will not match the teacher, and it will not be a working program. The table is the gap, the step count, and the memory.
+Teacher NLL of the finished window is not enough. A high repair rate inserts the teacher's local mode, which is often a space or a comma, and that mode can score *below* a real continuation. Read the decoded text.
 """
 )
 
@@ -515,22 +582,22 @@ def teacher_continuations():
     out = teacher.generate(
         input_ids=prefixes,
         attention_mask=attention,
-        max_new_tokens=CONTEXT,
+        max_new_tokens=CONTEXT - PREFIX,
         do_sample=False,
         pad_token_id=tokenizer.pad_token_id,
     )
-    cont = out[:, PREFIX:]
-    if cont.shape[1] < CONTEXT:
-        cont = F.pad(cont, (0, CONTEXT - cont.shape[1]), value=tokenizer.pad_token_id)
-    return cont[:, :CONTEXT]
+    full = out[:, :CONTEXT]
+    if full.shape[1] < CONTEXT:
+        full = F.pad(full, (0, CONTEXT - full.shape[1]), value=tokenizer.pad_token_id)
+    return full
 
 
 def run_ncm():
-    return generate_ncm(gen, vq, unigram, bench_batch)
+    return generate_ncm(gen, vq, unigram, prefixes=held[:bench_batch, :PREFIX])
 
 
 def run_hybrid(draft: torch.Tensor):
-    return hybrid_repair(draft, teacher, TAU)
+    return hybrid_repair(draft, teacher, TAU, prefix=PREFIX)
 
 
 with torch.no_grad():
@@ -542,9 +609,9 @@ with torch.no_grad():
     hybrid_nll_value = teacher_nll(teacher, hybrid)
 
 rows = [
-    ("teacher", teacher_nll_value, CONTEXT, teacher_ms / bench_batch, teacher_peak, "greedy, from a function prefix"),
-    ("next-concept", ncm_nll_value, len(LEVELS), ncm_ms / bench_batch, ncm_peak, "draft"),
-    ("hybrid", hybrid_nll_value, len(LEVELS) + 1, (ncm_ms + repair_ms) / bench_batch, max(ncm_peak, repair_peak), f"repair rate {repair_rate:.0%}"),
+    ("teacher", teacher_nll_value, CONTEXT - PREFIX, teacher_ms / bench_batch, teacher_peak, "greedy continuation"),
+    ("next-concept", ncm_nll_value, len(LEVELS), ncm_ms / bench_batch, ncm_peak, "same prefix"),
+    ("hybrid", hybrid_nll_value, len(LEVELS) + 1, (ncm_ms + repair_ms) / bench_batch, max(ncm_peak, repair_peak), f"repair rate {repair_rate:.0%} of the continuation"),
 ]
 print(f"{'writer':16} {'NLL':>8} {'forwards':>10} {'ms/seq':>10} {'peak GB':>8}  note")
 for name, nll, forwards, ms, peak, note in rows:

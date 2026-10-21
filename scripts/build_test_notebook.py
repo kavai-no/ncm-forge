@@ -202,19 +202,19 @@ def code_windows(split: str, limit: int, seed: int) -> torch.Tensor:
 @torch.no_grad()
 def teacher_from_prefixes(prefixes: torch.Tensor, sample: bool) -> torch.Tensor:
     attention = torch.ones_like(prefixes)
+    new = context - prefixes.shape[1]
+    kwargs = {"do_sample": True, "temperature": 0.9, "top_p": 0.95} if sample else {"do_sample": False}
     out = teacher.generate(
         input_ids=prefixes,
         attention_mask=attention,
-        max_new_tokens=context,
-        do_sample=sample,
-        temperature=0.9,
-        top_p=0.95,
+        max_new_tokens=new,
         pad_token_id=tokenizer.pad_token_id,
+        **kwargs,
     )
-    cont = out[:, prefixes.shape[1] :]
-    if cont.shape[1] < context:
-        cont = torch.nn.functional.pad(cont, (0, context - cont.shape[1]), value=tokenizer.pad_token_id)
-    return cont[:, :context]
+    full = out[:, :context]
+    if full.shape[1] < context:
+        full = torch.nn.functional.pad(full, (0, context - full.shape[1]), value=tokenizer.pad_token_id)
+    return full
 """
 )
 
@@ -268,16 +268,19 @@ def cascade_accuracy(tokens):
     return correct / max(1, total)
 
 
-def repair_rule_holds(draft, hybrid, teacher_model, tau_value):
+def repair_rule_holds(draft, hybrid, teacher_model, tau_value, prefix=0):
     logits = teacher_model(draft).logits
     pred = logits.argmax(-1)
     conf = logits.softmax(-1)[:, :-1].gather(-1, draft[:, 1:].unsqueeze(-1)).squeeze(-1)
     replace = conf < tau_value
+    if prefix > 1:
+        replace[:, : prefix - 1] = False
     kept = hybrid[:, 1:][~replace]
     kept_draft = draft[:, 1:][~replace]
     changed = hybrid[:, 1:][replace]
     changed_teacher = pred[:, :-1][replace]
-    same_prefix = torch.equal(hybrid[:, :1], draft[:, :1])
+    head = max(prefix, 1)
+    same_prefix = torch.equal(hybrid[:, :head], draft[:, :head])
     kept_ok = kept.numel() == 0 or torch.equal(kept, kept_draft)
     changed_ok = changed.numel() == 0 or torch.equal(changed, changed_teacher)
     return same_prefix and kept_ok and changed_ok, replace.float().mean().item()
@@ -288,7 +291,7 @@ md(
     """
 ## Run the tests
 
-Reconstruction and concept accuracy use CodeSearchNet test windows. The speed table continues the first `PREFIX` tokens of those windows with a greedy teacher, then compares that with an unconditional concept draft and the same draft after one repair pass. Negative log-likelihood is the teacher's score of the finished text. Lower is closer to the teacher. It is not a test of whether the code runs.
+Reconstruction and concept accuracy use CodeSearchNet test windows. The speed table continues the first `PREFIX` tokens of those windows. The concept draft encodes the bins inside that prefix and predicts the rest. The hybrid pass does not rewrite the prefix. Negative log-likelihood is the teacher's score of the finished window. A lower hybrid number is not a better function when the repair rate is high: the inserted tokens are the teacher's local mode, often whitespace.
 """
 )
 
@@ -309,7 +312,7 @@ print("per level:", " ".join(f"L{i+1}:{acc:.2f}" for i, acc in enumerate(per_lev
 with torch.no_grad():
     teacher_tokens, teacher_ms, teacher_peak = cuda_ms(lambda: teacher_from_prefixes(held[:BENCH_BATCH, :PREFIX], sample=False))
     teacher_nll_value = teacher_nll(teacher, teacher_tokens)
-    draft, ncm_ms, ncm_peak = cuda_ms(lambda: generate_ncm(gen, vq, unigram, BENCH_BATCH))
+    draft, ncm_ms, ncm_peak = cuda_ms(lambda: generate_ncm(gen, vq, unigram, prefixes=held[:BENCH_BATCH, :PREFIX]))
     ncm_nll_value = teacher_nll(teacher, draft)
 
     calls = {"n": 0}
@@ -321,16 +324,16 @@ with torch.no_grad():
 
     teacher.forward = counting_forward
     try:
-        (hybrid, reported_rate), repair_ms, repair_peak = cuda_ms(lambda: hybrid_repair(draft, teacher, tau))
+        (hybrid, reported_rate), repair_ms, repair_peak = cuda_ms(lambda: hybrid_repair(draft, teacher, tau, prefix=PREFIX))
         forward_calls = calls["n"]
-        rule_ok, rate = repair_rule_holds(draft, hybrid, teacher, tau)
+        rule_ok, rate = repair_rule_holds(draft, hybrid, teacher, tau, prefix=PREFIX)
     finally:
         teacher.forward = original_forward
     hybrid_nll_value = teacher_nll(teacher, hybrid)
 
 rows = [
-    ("teacher", teacher_nll_value, context, teacher_ms / BENCH_BATCH, teacher_peak, "greedy, from a function prefix"),
-    ("next-concept", ncm_nll_value, len(levels), ncm_ms / BENCH_BATCH, ncm_peak, "unconditional draft"),
+    ("teacher", teacher_nll_value, context - PREFIX, teacher_ms / BENCH_BATCH, teacher_peak, "greedy continuation"),
+    ("next-concept", ncm_nll_value, len(levels), ncm_ms / BENCH_BATCH, ncm_peak, "same prefix"),
     ("hybrid", hybrid_nll_value, len(levels) + 1, (ncm_ms + repair_ms) / BENCH_BATCH, max(ncm_peak, repair_peak), f"repair rate {rate:.0%}"),
 ]
 print()
