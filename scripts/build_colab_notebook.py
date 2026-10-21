@@ -33,7 +33,7 @@ A next-concept model writes a whole level of discrete codes in one forward. The 
 
 The teacher is loaded in fp16, its embedding table is copied, then it is **deleted** before the concept model trains. It is loaded again only for the benchmark. Peak on a 0.5B run stays under 8 GB. A 1.5B run stays under 12 GB.
 
-Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet, in Qwen's own vocabulary. A finished checkpoint at `/content/ncm-hybrid/hybrid.pt` or on Drive is reloaded: the tokenizer stays frozen and the generator continues. A fresh run is 6,000 tokenizer steps and 16,000 generator steps. The generator now trains the future coarse codes at 4× the loss of the other levels, and the finer levels are trained on its own coarse sketch as well as the true one. A checkpoint is written every 1,000 steps.
+Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet, in Qwen's own vocabulary. A finished tokenizer checkpoint is frozen. The generator trained on 32,768 windows is not loaded: it memorized that buffer. This run trains a new generator for one pass over 131,072 windows and stops when the held-out coarse continuation stops rising. The training `coarse` number is not the score.
 
 This is still not the paper's training run (billions of tokens, a ~100M generator). Judge it by the round trip and by whether the continuation contains code, not by teacher NLL. A string of `=` can score better than a real function.
 """
@@ -74,16 +74,21 @@ GEN_DIM = 512
 GEN_LAYERS = 8
 GEN_HEADS = 8
 DEC_LAYERS = 4
-N_TRAIN = 32768
+N_TRAIN = 131072
 N_VAL = 512
 PREFIX = 64
 VQ_STEPS = 6000
-GEN_STEPS = 16000
-BATCH = 8
 GEN_BATCH = 16
+GEN_STEPS = N_TRAIN // GEN_BATCH
+BATCH = 8
 LR = 3e-4
 TAU = 0.45
 COARSE_LOSS_WEIGHT = 4.0
+OBJECTIVE = "one-pass-heldout"
+HELD_EVERY = 1000
+HELD_PATIENCE = 3
+HELD_MIN_STEP = 4000
+HELD_MIN_GAIN = 0.005
 SEED = 7
 LOG_EVERY = 100
 OUTPUT = Path("/content/ncm-hybrid")
@@ -97,6 +102,8 @@ DATASET_CONFIG = "python"
 assert GEN_DIM % GEN_HEADS == 0, "GEN_DIM must divide evenly across heads"
 assert VQ_DIM % GEN_HEADS == 0, "VQ_DIM must divide evenly across heads"
 assert LEVELS[-1] == CONTEXT, "the finest level has to be the token length"
+assert N_TRAIN % GEN_BATCH == 0, "one pass has to fill whole batches"
+assert GEN_STEPS == N_TRAIN // GEN_BATCH
 
 if not torch.cuda.is_available():
     raise SystemExit("No GPU. In Colab: Runtime → Change runtime type → T4 GPU, then rerun.")
@@ -450,8 +457,22 @@ def code_windows(split: str, limit: int, seed: int) -> torch.Tensor:
     return chosen
 
 
-train = code_windows("train", N_TRAIN, SEED).to(device)
-held = code_windows("validation", N_VAL, SEED + 1).to(device)
+def cached_windows(split: str, limit: int, seed: int, name: str) -> torch.Tensor:
+    path = OUTPUT / name
+    if path.exists():
+        cached = torch.load(path, map_location="cpu", weights_only=True)
+        if tuple(cached.shape) == (limit, CONTEXT):
+            print(f"loaded {path} {tuple(cached.shape)}")
+            return cached.to(device)
+        print(f"ignoring {path}, shape {tuple(cached.shape)} is not {(limit, CONTEXT)}")
+    windows = code_windows(split, limit, seed).cpu()
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    torch.save(windows, path)
+    return windows.to(device)
+
+
+train = cached_windows("train", N_TRAIN, SEED, "train.pt")
+held = cached_windows("validation", N_VAL, SEED + 1, "held.pt")
 print(tokenizer.decode(train[0].tolist(), skip_special_tokens=True)[:500])
 
 teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16, low_cpu_mem_usage=True)
@@ -470,7 +491,7 @@ md(
     """
 ## Train the hierarchy
 
-Stage 1 trains the tokenizer only when no finished checkpoint is loaded. A matching checkpoint freezes those weights. Stage 2 trains the generator. The coarsest future codes are weighted 4×, because that level flattened near 3.5% while the fine levels were still climbing. From the second half of generator training, a level is conditioned on the model's own predicted sketch rather than the true one 85% of the time, which is the reconstruction it will see when it drafts. The live progress is a bar. A pasteable log line every 100 steps includes that coarse accuracy. Checkpoints land in `/content/ncm-hybrid/hybrid.pt` every 1,000 steps. Both stages stay in fp32.
+Stage 1 trains the tokenizer only when no finished checkpoint is loaded. A matching checkpoint freezes those weights. Stage 2 does not continue the previous generator. That one memorized 32,768 windows: its training coarse accuracy reached 0.40 while the held-out continuation fell to 0.016. A new generator walks 131,072 windows once. Every 1,000 steps the held-out coarse continuation is measured. Training stops after step 4,000 if that number gains less than 0.005 three checks in a row, and the weights from the best check are the ones that get benchmarked. The training `coarse` field is the batch the model just saw. It is not the score.
 """
 )
 
@@ -516,6 +537,9 @@ if ckpt_path.exists():
     else:
         print("checkpoint at", ckpt_path, "is a different architecture, starting over")
 
+stopped_early = False
+best_held_coarse = -1.0
+
 
 def save_checkpoint(vq_step, gen_step, generator=None, prior=None):
     payload = {
@@ -531,6 +555,10 @@ def save_checkpoint(vq_step, gen_step, generator=None, prior=None):
         "dec_layers": DEC_LAYERS,
         "prefix": PREFIX,
         "tau": TAU,
+        "n_train": N_TRAIN,
+        "objective": OBJECTIVE,
+        "stopped_early": stopped_early,
+        "best_held_coarse": best_held_coarse,
         "vq_step": vq_step,
         "gen_step": gen_step,
         "vq": vq.state_dict(),
@@ -598,11 +626,27 @@ unigram = unigram.to(device)
 
 gen = NextConcept(vq, GEN_DIM, GEN_LAYERS, GEN_HEADS).to(device)
 gopt = torch.optim.AdamW((p for p in gen.parameters() if p.requires_grad), lr=LR)
-start_gen = 0
-if resume is not None and "generator" in resume:
+same_pass = (
+    resume is not None
+    and resume.get("objective") == OBJECTIVE
+    and int(resume.get("n_train", -1)) == N_TRAIN
+    and "generator" in resume
+)
+best_held_coarse = -1.0
+stopped_early = False
+best_state = None
+best_step = 0
+if same_pass:
     gen.load_state_dict(resume["generator"])
     start_gen = min(GEN_STEPS, int(resume.get("gen_step", 0)))
     gen_history = list(resume.get("gen_history", []))
+    best_held_coarse = float(resume.get("best_held_coarse", -1.0))
+    stopped_early = bool(resume.get("stopped_early", False))
+    best_step = start_gen
+    print(f"resuming the one-pass generator at step {start_gen}, best held-out coarse {best_held_coarse:.3f}")
+else:
+    start_gen = 0
+    print("generator reinitialized. The previous generator memorized its 32,768 windows and was not loaded.")
 gen.train()
 t1 = time.time()
 coarse_until = int(GEN_STEPS * 0.4)
@@ -610,9 +654,36 @@ coarse_hi = max(i for i, length in enumerate(LEVELS) if length <= PREFIX)
 coarse_future = [i for i, (start, _end) in enumerate(vq._bins(CONTEXT, LEVELS[0])) if start >= PREFIX]
 if not coarse_future:
     raise RuntimeError("PREFIX covers every coarsest bin, so there is nothing to continue")
-concept_bar = tqdm(range(start_gen, GEN_STEPS), desc="concepts", initial=start_gen, total=GEN_STEPS, mininterval=1, dynamic_ncols=True)
-for step in concept_bar:
-    ix = torch.randint(0, train.shape[0], (GEN_BATCH,), device=device)
+order = torch.randperm(train.shape[0], generator=torch.Generator().manual_seed(SEED + 3))
+gen_steps_done = start_gen
+stall = 0
+
+
+@torch.no_grad()
+def held_coarse_continuation(rows: torch.Tensor) -> float:
+    training = gen.training
+    gen.eval()
+    hit = count = 0
+    for start in range(0, rows.shape[0], 4):
+        batch = rows[start : start + 4]
+        codes = vq.encode(batch)
+        cond = torch.zeros(batch.shape[0], batch.shape[1], vq.dim, device=batch.device)
+        cond[:, :PREFIX] = vq.embed(batch[:, :PREFIX])
+        pred = gen.forward_level(cond, 0).argmax(-1)
+        hit += (pred[:, coarse_future] == codes[0][:, coarse_future]).sum().item()
+        count += codes[0][:, coarse_future].numel()
+    if training:
+        gen.train()
+    return hit / max(1, count)
+
+
+if stopped_early or start_gen >= GEN_STEPS:
+    print(f"generator left as loaded, step {start_gen}, held-out coarse {best_held_coarse:.3f}")
+    concept_bar = None
+else:
+    concept_bar = tqdm(range(start_gen, GEN_STEPS), desc="concepts", initial=start_gen, total=GEN_STEPS, mininterval=1, dynamic_ncols=True)
+for step in concept_bar or []:
+    ix = order[step * GEN_BATCH : (step + 1) * GEN_BATCH].to(device)
     with torch.no_grad():
         codes, recons = vq.contexts(train[ix])
         prefix_embed = vq.embed(train[ix][:, :PREFIX])
@@ -672,11 +743,35 @@ for step in concept_bar:
         concept_bar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{acc:.3f}", coarse=f"{coarse_acc:.3f}", refresh=False)
         tqdm.write(
             f"[concepts]  {step:4d}  loss {loss.item():.3f}  acc {acc:.3f}  "
-            f"coarse {coarse_acc:.3f}  {time.time()-t1:.0f}s"
+            f"train-coarse {coarse_acc:.3f}  {time.time()-t1:.0f}s"
         )
-    if step % 1000 == 999 or step == GEN_STEPS - 1:
-        save_checkpoint(VQ_STEPS, step + 1, gen, unigram)
-concept_bar.close()
+    if step % HELD_EVERY == HELD_EVERY - 1 or step == GEN_STEPS - 1:
+        held_c = held_coarse_continuation(held)
+        if held_c > best_held_coarse + HELD_MIN_GAIN:
+            best_held_coarse = held_c
+            best_step = step + 1
+            stall = 0
+            best_state = {k: v.detach().cpu().clone() for k, v in gen.state_dict().items()}
+        else:
+            stall += 1
+        gen_steps_done = step + 1
+        save_checkpoint(VQ_STEPS, gen_steps_done, gen, unigram)
+        tqdm.write(f"held-out coarse continuation {held_c:.3f}  best {best_held_coarse:.3f} at step {best_step}")
+        if gen_steps_done >= HELD_MIN_STEP and stall >= HELD_PATIENCE:
+            stopped_early = True
+            tqdm.write("stopping: held-out coarse continuation stopped rising")
+            break
+else:
+    if concept_bar is not None:
+        stopped_early = True
+if concept_bar is not None:
+    concept_bar.close()
+if best_state is not None:
+    gen.load_state_dict(best_state)
+    gen_steps_done = best_step
+    tqdm.write(f"restored generator from held-out coarse {best_held_coarse:.3f} at step {best_step}")
+if stopped_early:
+    save_checkpoint(VQ_STEPS, gen_steps_done, gen, unigram)
 
 gen.eval()
 correct = 0
@@ -872,8 +967,12 @@ torch.save(
         "dec_layers": DEC_LAYERS,
         "prefix": PREFIX,
         "tau": TAU,
+        "n_train": N_TRAIN,
+        "objective": OBJECTIVE,
+        "stopped_early": True,
+        "best_held_coarse": best_held_coarse,
         "vq_step": VQ_STEPS,
-        "gen_step": GEN_STEPS,
+        "gen_step": gen_steps_done,
         "vq": vq.state_dict(),
         "generator": gen.state_dict(),
         "unigram": unigram.detach().cpu(),
