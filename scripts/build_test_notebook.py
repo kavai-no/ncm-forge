@@ -40,7 +40,7 @@ Runtime → Change runtime type → **T4 GPU**. The teacher is loaded in fp16. A
 
 code(
     """
-%pip install -q "transformers>=4.46,<5" accelerate sentencepiece protobuf datasets
+%pip install -q "transformers>=5.3,<6" "datasets>=3" "huggingface-hub>=1.32,<2" accelerate sentencepiece protobuf
 """
 )
 
@@ -166,7 +166,7 @@ if tokenizer.pad_token is None:
 if int(tokenizer.vocab_size) != vocab:
     raise SystemExit(f"tokenizer vocab {tokenizer.vocab_size} does not match checkpoint vocab {vocab}")
 
-teacher = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+teacher = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float16, low_cpu_mem_usage=True)
 teacher.to(device)
 teacher.eval()
 print(f"teacher resident {torch.cuda.memory_allocated()/1024**3:.2f} GB")

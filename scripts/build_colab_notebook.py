@@ -39,7 +39,7 @@ Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Tra
 
 code(
     """
-%pip install -q "transformers>=4.46,<5" accelerate sentencepiece protobuf datasets
+%pip install -q "transformers>=5.3,<6" "datasets>=3" "huggingface-hub>=1.32,<2" accelerate sentencepiece protobuf
 """
 )
 
@@ -381,7 +381,7 @@ train = code_windows("train", N_TRAIN, SEED).to(device)
 held = code_windows("validation", N_VAL, SEED + 1).to(device)
 print(tokenizer.decode(train[0].tolist(), skip_special_tokens=True)[:500])
 
-teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16, low_cpu_mem_usage=True)
 teacher.to(device)
 teacher.eval()
 teacher_embed = teacher.get_input_embeddings().weight.detach().float().cpu()
@@ -496,7 +496,7 @@ Quality is the teacher's negative log-likelihood of each writer (lower is closer
 
 code(
     """
-teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+teacher = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.float16, low_cpu_mem_usage=True)
 teacher.to(device)
 teacher.eval()
 bench_batch = 4
