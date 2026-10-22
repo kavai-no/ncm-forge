@@ -4,21 +4,20 @@
 
 1. Branch from `main`.
 2. Run `npm test` and `npm run typecheck`.
-3. Describe what changed and how you checked it. For a training or scoring change, say what the numbers did, including when they got worse.
+3. Describe what changed and how you checked it. For a drafting change, say whether the text still matched Qwen and what happened to tokens per Qwen forward.
 
 ## What belongs here
 
-- Fixes to the lab, the exported trainer, or the Colab notebooks.
-- Tests that fail when the hybrid repair rule is wrong.
+- Fixes to the accept/reject rule, the lab, or the Colab notebooks.
+- Tests that fail when speculative text differs from greedy text.
 
-Do not commit secrets, `.env` files, or checkpoints. `hybrid.pt` is a training output, not source.
+Do not commit secrets, `.env` files, or checkpoints. `drafter.pt` is a training output, not source.
 
 ## Notebooks
 
-`scripts/build_colab_notebook.py` writes `src/lib/ncm/ncm_hybrid_colab.ipynb`.
-`scripts/build_test_notebook.py` copies the model cell from that notebook into `src/lib/ncm/ncm_hybrid_test.ipynb`.
+`scripts/build_speculative_notebook.py` writes `src/lib/ncm/qwen_speculative_colab.ipynb` and `src/lib/ncm/qwen_speculative_test.ipynb`.
 
-Change the builders, then regenerate. Do not hand-edit the notebooks and the builders in opposite directions.
+Change the builder, then regenerate. Do not hand-edit the notebooks and the builder in opposite directions.
 
 ## License
 
