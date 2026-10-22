@@ -131,6 +131,8 @@ n_head = int(ckpt["gen_heads"])
 PREFIX = int(ckpt.get("prefix", PREFIX))
 vq = MultiScaleResidualVQ(vocab, int(ckpt["vq_dim"]), codebook, levels, n_dec=n_dec, n_head=n_head).to(device)
 gen = NextConcept(vq, int(ckpt["gen_dim"]), int(ckpt["gen_layers"]), n_head).to(device)
+if not any(key.startswith("coarse_") for key in ckpt["generator"]):
+    raise SystemExit("This checkpoint predicts every future coarse code at once. Use a causal-next-code checkpoint.")
 gen.load_state_dict(ckpt["generator"], strict=True)
 unigram = ckpt["unigram"].to(device).float()
 unigram = unigram / unigram.sum()
@@ -251,7 +253,10 @@ def concept_accuracy(tokens):
         batch = tokens[start : start + 4]
         codes, recons = vq.contexts(batch)
         for li in range(len(levels)):
-            pred = gen.forward_level(recons[li], li).argmax(-1)
+            if li == 0:
+                pred = gen.forward_coarse(codes[0]).argmax(-1)
+            else:
+                pred = gen.forward_level(recons[li], li).argmax(-1)
             hit = (pred == codes[li]).sum().item()
             if len(per_level) <= li:
                 per_level.append([0, 0])
@@ -269,8 +274,12 @@ def cascade_accuracy(tokens):
     for start in range(0, tokens.shape[0], 4):
         batch = tokens[start : start + 4]
         recon = torch.zeros(batch.shape[0], batch.shape[1], vq.dim, device=batch.device)
-        codes = []
-        for li in range(len(levels)):
+        coarse = torch.zeros(batch.shape[0], levels[0], dtype=torch.long, device=batch.device)
+        for t in range(levels[0]):
+            coarse[:, t] = gen.forward_coarse(coarse)[:, t].argmax(-1)
+        codes = [coarse]
+        recon = vq.add_level(recon, coarse, 0)
+        for li in range(1, len(levels)):
             idx = gen.forward_level(recon, li).argmax(-1)
             codes.append(idx)
             recon = vq.add_level(recon, idx, li)

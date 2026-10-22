@@ -28,7 +28,7 @@ The method is [Next-Concept Modeling](https://arxiv.org/abs/2610.14162) ([HazyRe
 
 ## What a short run will not do
 
-The lab is a miniature. The Colab notebook freezes a Qwen-vocabulary tokenizer and trains a new generator for one pass over 131,072 CodeSearchNet windows. It stops when the held-out coarse continuation stops rising, and it does not keep training a generator that has memorized a small buffer. It is still not the paper's training job (billions of tokens). It will not reproduce the LM1B, OpenWebText, or XSum numbers. Judge a run by the held-out coarse continuation and by whether the continuation contains code, not by the training coarse accuracy or by teacher NLL.
+The lab is a miniature. The Colab notebook freezes a Qwen-vocabulary tokenizer and trains a generator whose coarsest level predicts one code at a time from the codes before it. It walks 131,072 CodeSearchNet windows once and stops when the held-out accuracy of that next code stops rising. It is still not the paper's training job (billions of tokens). It will not reproduce the LM1B, OpenWebText, or XSum numbers. Judge a run by the held-out next code and by the next eight decoded tokens, not by teacher NLL.
 
 Teacher weights stay under their own licenses. The MIT license in this repository covers this code only.
 

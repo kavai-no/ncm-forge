@@ -33,7 +33,7 @@ A next-concept model writes a whole level of discrete codes in one forward. The 
 
 The teacher is loaded in fp16, its embedding table is copied, then it is **deleted** before the concept model trains. It is loaded again only for the benchmark. Peak on a 0.5B run stays under 8 GB. A 1.5B run stays under 12 GB.
 
-Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet, in Qwen's own vocabulary. A finished tokenizer checkpoint is frozen. The generator trained on 32,768 windows is not loaded: it memorized that buffer. This run trains a new generator for one pass over 131,072 windows and stops when the held-out coarse continuation stops rising. The training `coarse` number is not the score.
+Runtime → Change runtime type → **T4 GPU**. Then run the cells in order. Training text is Python functions from CodeSearchNet, in Qwen's own vocabulary. A finished tokenizer checkpoint is frozen. The generator is new: the coarsest level predicts one code at a time from the codes before it, and the finer levels stay parallel. It walks 131,072 windows once and stops when the held-out next-code accuracy stops rising. That number is the score. The training accuracy is not.
 
 This is still not the paper's training run (billions of tokens, a ~100M generator). Judge it by the round trip and by whether the continuation contains code, not by teacher NLL. A string of `=` can score better than a real function.
 """
@@ -84,7 +84,7 @@ BATCH = 8
 LR = 3e-4
 TAU = 0.45
 COARSE_LOSS_WEIGHT = 4.0
-OBJECTIVE = "one-pass-heldout"
+OBJECTIVE = "causal-next-code"
 HELD_EVERY = 1000
 HELD_PATIENCE = 3
 HELD_MIN_STEP = 4000
@@ -241,7 +241,11 @@ class MultiScaleResidualVQ(nn.Module):
 
 
 class NextConcept(nn.Module):
-    \"\"\"Predicts one level from the reconstruction so far. Positions in a level are independent.\"\"\"
+    \"\"\"Finer levels are parallel. The coarsest level is a causal next-code model.
+
+    Position t of the coarsest level predicts that code from codes 0..t-1 only.
+    A future code is never an input to its own prediction.
+    \"\"\"
 
     def __init__(self, vq: MultiScaleResidualVQ, dim: int, n_layer: int, n_head: int):
         super().__init__()
@@ -258,13 +262,38 @@ class NextConcept(nn.Module):
         )
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, codebook)
+        coarse_len = self.levels[0]
+        self.coarse_in = nn.Linear(vq.dim, dim)
+        self.coarse_bos = nn.Parameter(torch.zeros(1, 1, dim))
+        self.coarse_pos = nn.Parameter(torch.randn(coarse_len, dim) * 0.02)
+        self.coarse_blocks = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(dim, n_head, dim * 4, dropout=0.0, batch_first=True, norm_first=True, activation="gelu")
+                for _ in range(4)
+            ]
+        )
+        self.coarse_norm = nn.LayerNorm(dim)
+        self.coarse_head = nn.Linear(dim, codebook)
 
     def forward_level(self, recon: torch.Tensor, level: int) -> torch.Tensor:
+        if level == 0:
+            raise RuntimeError("the coarsest level is causal; call forward_coarse")
         pooled, _bins = self.vq._pool(recon, self.levels[level])
         x = self.in_proj(pooled) + self.pos[level]
         for block in self.blocks:
             x = block(x)
         return self.head(self.norm(x))
+
+    def forward_coarse(self, codes: torch.Tensor) -> torch.Tensor:
+        \"\"\"codes is (batch, level_length). Logits at t depend only on codes before t.\"\"\"
+        emb = self.coarse_in(self.vq.codebooks[0][codes])
+        bos = self.coarse_bos.expand(codes.shape[0], 1, -1)
+        x = torch.cat([bos, emb[:, :-1]], dim=1) + self.coarse_pos
+        length = codes.shape[1]
+        mask = torch.triu(torch.full((length, length), float("-inf"), device=x.device), diagonal=1)
+        for block in self.coarse_blocks:
+            x = block(x, src_mask=mask)
+        return self.coarse_head(self.coarse_norm(x))
 
 
 def init_from_teacher(vq: MultiScaleResidualVQ, teacher_embed: torch.Tensor) -> None:
@@ -292,10 +321,11 @@ def generate_ncm(
     batch: int | None = None,
     prefixes: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    \"\"\"Draft a window. Bins inside the prefix keep their encoded codes.
+    \"\"\"Draft a window. The prefix keeps its encoded codes.
 
-    The returned tokens start with that prefix. The coarsest level sees the prefix
-    embedding, so the future codes are a continuation rather than an unconditional draw.
+    The coarsest future codes are predicted one at a time, each from the codes
+    before it. Finer levels then run in parallel on that sketch. The returned
+    tokens start with the prefix.
     \"\"\"
     if prefixes is not None:
         batch = prefixes.shape[0]
@@ -304,14 +334,22 @@ def generate_ncm(
         known_idx = known_mask = None
         if batch is None:
             raise ValueError("pass batch or prefixes")
-    recon = torch.zeros(batch, vq.levels[-1], vq.dim, device=vq.embed.weight.device, dtype=vq.embed.weight.dtype)
-    codes = []
-    for li in range(len(vq.levels)):
-        cond = recon
-        if prefixes is not None and li == 0:
-            cond = recon.clone()
-            cond[:, : prefixes.shape[1]] = vq.embed(prefixes)
-        pred = gen.forward_level(cond, li).argmax(-1)
+    device = vq.embed.weight.device
+    recon = torch.zeros(batch, vq.levels[-1], vq.dim, device=device, dtype=vq.embed.weight.dtype)
+    if known_idx is not None:
+        coarse = known_idx[0].clone()
+        for t in range(coarse.shape[1]):
+            if bool(known_mask[0][:, t].all()):
+                continue
+            coarse[:, t] = gen.forward_coarse(coarse)[:, t].argmax(-1)
+    else:
+        coarse = torch.zeros(batch, vq.levels[0], dtype=torch.long, device=device)
+        for t in range(coarse.shape[1]):
+            coarse[:, t] = gen.forward_coarse(coarse)[:, t].argmax(-1)
+    codes = [coarse]
+    recon = vq.add_level(recon, coarse, 0)
+    for li in range(1, len(vq.levels)):
+        pred = gen.forward_level(recon, li).argmax(-1)
         if known_mask is not None:
             pred = torch.where(known_mask[li], known_idx[li], pred)
         codes.append(pred)
@@ -491,7 +529,7 @@ md(
     """
 ## Train the hierarchy
 
-Stage 1 trains the tokenizer only when no finished checkpoint is loaded. A matching checkpoint freezes those weights. Stage 2 does not continue the previous generator. That one memorized 32,768 windows: its training coarse accuracy reached 0.40 while the held-out continuation fell to 0.016. A new generator walks 131,072 windows once. Every 1,000 steps the held-out coarse continuation is measured. Training stops after step 4,000 if that number gains less than 0.005 three checks in a row, and the weights from the best check are the ones that get benchmarked. The training `coarse` field is the batch the model just saw. It is not the score.
+Stage 1 trains the tokenizer only when no finished checkpoint is loaded. A matching checkpoint freezes those weights. Stage 2 does not load an older generator. Those predicted every future coarse code at once and peaked at 0.047 on held-out text. This generator predicts the next coarse code from the true codes before it, teacher-forced, then the finer levels run in parallel. The stop metric is the held-out accuracy of that next code, the one that covers the eight tokens after the prefix. Training stops after step 4,000 if that number gains less than 0.005 three checks in a row.
 """
 )
 
@@ -643,10 +681,10 @@ if same_pass:
     best_held_coarse = float(resume.get("best_held_coarse", -1.0))
     stopped_early = bool(resume.get("stopped_early", False))
     best_step = start_gen
-    print(f"resuming the one-pass generator at step {start_gen}, best held-out coarse {best_held_coarse:.3f}")
+    print(f"resuming the causal generator at step {start_gen}, best held-out next code {best_held_coarse:.3f}")
 else:
     start_gen = 0
-    print("generator reinitialized. The previous generator memorized its 32,768 windows and was not loaded.")
+    print("generator reinitialized. Older generators predicted every future code at once and were not loaded.")
 gen.train()
 t1 = time.time()
 coarse_until = int(GEN_STEPS * 0.4)
@@ -660,25 +698,27 @@ stall = 0
 
 
 @torch.no_grad()
-def held_coarse_continuation(rows: torch.Tensor) -> float:
+def held_next_code(rows: torch.Tensor) -> float:
+    \"\"\"Accuracy of the single coarse code that covers the eight tokens after the prefix.\"\"\"
     training = gen.training
     gen.eval()
     hit = count = 0
+    t = coarse_future[0]
     for start in range(0, rows.shape[0], 4):
         batch = rows[start : start + 4]
-        codes = vq.encode(batch)
-        cond = torch.zeros(batch.shape[0], batch.shape[1], vq.dim, device=batch.device)
-        cond[:, :PREFIX] = vq.embed(batch[:, :PREFIX])
-        pred = gen.forward_level(cond, 0).argmax(-1)
-        hit += (pred[:, coarse_future] == codes[0][:, coarse_future]).sum().item()
-        count += codes[0][:, coarse_future].numel()
+        codes0 = vq.encode(batch)[0]
+        ctx = codes0.clone()
+        ctx[:, t:] = 0
+        pred = gen.forward_coarse(ctx)[:, t].argmax(-1)
+        hit += (pred == codes0[:, t]).sum().item()
+        count += codes0.shape[0]
     if training:
         gen.train()
     return hit / max(1, count)
 
 
 if stopped_early or start_gen >= GEN_STEPS:
-    print(f"generator left as loaded, step {start_gen}, held-out coarse {best_held_coarse:.3f}")
+    print(f"generator left as loaded, step {start_gen}, held-out next code {best_held_coarse:.3f}")
     concept_bar = None
 else:
     concept_bar = tqdm(range(start_gen, GEN_STEPS), desc="concepts", initial=start_gen, total=GEN_STEPS, mininterval=1, dynamic_ncols=True)
@@ -686,49 +726,38 @@ for step in concept_bar or []:
     ix = order[step * GEN_BATCH : (step + 1) * GEN_BATCH].to(device)
     with torch.no_grad():
         codes, recons = vq.contexts(train[ix])
-        prefix_embed = vq.embed(train[ix][:, :PREFIX])
         known_idx, known_mask = _prefix_codes(vq, train[ix][:, :PREFIX])
     hi = coarse_hi if step < coarse_until else len(LEVELS) - 1
-    # Own sketch, as in generation: predicted codes, true codes inside the prefix.
-    # Finer levels see this instead of the true sketch once training is underway.
-    own = torch.zeros_like(recons[0])
+    next_pos = coarse_future[0]
+    logits0 = gen.forward_coarse(codes[0])
+    future_logits = logits0[:, coarse_future]
+    future_target = codes[0][:, coarse_future]
+    loss = COARSE_LOSS_WEIGHT * F.cross_entropy(
+        future_logits.reshape(-1, future_logits.size(-1)), future_target.reshape(-1)
+    )
+    weight_sum = float(COARSE_LOSS_WEIGHT)
+    next_hit = (logits0[:, next_pos].argmax(-1) == codes[0][:, next_pos]).sum().item()
+    next_count = codes[0].shape[0]
+    coarse_hit = (future_logits.argmax(-1) == future_target).sum().item()
+    coarse_count = future_target.numel()
+    correct = coarse_hit
+    total = coarse_count
+    pred0 = torch.where(known_mask[0], known_idx[0], logits0.argmax(-1).detach())
+    own = vq.add_level(torch.zeros_like(recons[0]), pred0, 0)
     ss = min(0.85, 0.25 + 0.75 * (step / max(1, GEN_STEPS - 1)))
-    loss = torch.zeros((), device=device)
-    weight_sum = 0.0
-    correct = 0
-    total = 0
-    coarse_hit = 0
-    coarse_count = 0
-    for li in range(hi + 1):
+    for li in range(1, hi + 1):
         target = codes[li]
-        if li == 0:
-            cond = torch.zeros_like(recons[0])
-            cond[:, :PREFIX] = prefix_embed
-        elif torch.rand((), device=device).item() < ss:
+        if torch.rand((), device=device).item() < ss:
             cond = own
         else:
             cond = recons[li]
         logits = gen.forward_level(cond, li)
-        if li == 0:
-            logits_l = logits[:, coarse_future]
-            target_l = target[:, coarse_future]
-            weight = COARSE_LOSS_WEIGHT
-        else:
-            logits_l = logits
-            target_l = target
-            weight = 1.0
-        loss = loss + weight * F.cross_entropy(
-            logits_l.reshape(-1, logits_l.size(-1)), target_l.reshape(-1)
-        )
-        weight_sum += weight
-        hit = (logits_l.argmax(-1) == target_l).sum().item()
+        loss = loss + F.cross_entropy(logits.reshape(-1, logits.size(-1)), target.reshape(-1))
+        weight_sum += 1.0
+        hit = (logits.argmax(-1) == target).sum().item()
         correct += hit
-        total += target_l.numel()
-        if li == 0:
-            coarse_hit += hit
-            coarse_count += target_l.numel()
-        pred = logits.argmax(-1).detach()
-        pred = torch.where(known_mask[li], known_idx[li], pred)
+        total += target.numel()
+        pred = torch.where(known_mask[li], known_idx[li], logits.argmax(-1).detach())
         own = vq.add_level(own, pred, li)
     loss = loss / weight_sum
     gopt.zero_grad(set_to_none=True)
@@ -738,15 +767,16 @@ for step in concept_bar or []:
     concept_bar.set_postfix(loss=f"{loss.item():.3f}", refresh=False)
     if step % LOG_EVERY == 0 or step == GEN_STEPS - 1:
         acc = correct / max(1, total)
-        coarse_acc = coarse_hit / max(1, coarse_count)
-        gen_history.append((step, loss.item(), acc))
-        concept_bar.set_postfix(loss=f"{loss.item():.3f}", acc=f"{acc:.3f}", coarse=f"{coarse_acc:.3f}", refresh=False)
+        next_acc = next_hit / max(1, next_count)
+        future_acc = coarse_hit / max(1, coarse_count)
+        gen_history.append((step, loss.item(), next_acc))
+        concept_bar.set_postfix(loss=f"{loss.item():.3f}", next=f"{next_acc:.3f}", refresh=False)
         tqdm.write(
             f"[concepts]  {step:4d}  loss {loss.item():.3f}  acc {acc:.3f}  "
-            f"train-coarse {coarse_acc:.3f}  {time.time()-t1:.0f}s"
+            f"next {next_acc:.3f}  future {future_acc:.3f}  {time.time()-t1:.0f}s"
         )
     if step % HELD_EVERY == HELD_EVERY - 1 or step == GEN_STEPS - 1:
-        held_c = held_coarse_continuation(held)
+        held_c = held_next_code(held)
         if held_c > best_held_coarse + HELD_MIN_GAIN:
             best_held_coarse = held_c
             best_step = step + 1
@@ -756,10 +786,10 @@ for step in concept_bar or []:
             stall += 1
         gen_steps_done = step + 1
         save_checkpoint(VQ_STEPS, gen_steps_done, gen, unigram)
-        tqdm.write(f"held-out coarse continuation {held_c:.3f}  best {best_held_coarse:.3f} at step {best_step}")
+        tqdm.write(f"held-out next code {held_c:.3f}  best {best_held_coarse:.3f} at step {best_step}")
         if gen_steps_done >= HELD_MIN_STEP and stall >= HELD_PATIENCE:
             stopped_early = True
-            tqdm.write("stopping: held-out coarse continuation stopped rising")
+            tqdm.write("stopping: held-out next code stopped rising")
             break
 else:
     if concept_bar is not None:
@@ -769,7 +799,7 @@ if concept_bar is not None:
 if best_state is not None:
     gen.load_state_dict(best_state)
     gen_steps_done = best_step
-    tqdm.write(f"restored generator from held-out coarse {best_held_coarse:.3f} at step {best_step}")
+    tqdm.write(f"restored generator from held-out next code {best_held_coarse:.3f} at step {best_step}")
 if stopped_early:
     save_checkpoint(VQ_STEPS, gen_steps_done, gen, unigram)
 
@@ -792,7 +822,7 @@ print("round trip", tokenizer.decode(trip[0].tolist(), skip_special_tokens=True)
 per_level = []
 with torch.no_grad():
     probe = held[:64]
-    for li in range(len(LEVELS)):
+    for li in range(1, len(LEVELS)):
         hit = 0
         count = 0
         for start in range(0, probe.shape[0], 4):
@@ -802,20 +832,8 @@ with torch.no_grad():
             hit += (pred == codes[li]).sum().item()
             count += codes[li].numel()
         per_level.append(hit / max(1, count))
-print("held-out next-level", " ".join(f"L{i}:{acc:.2f}" for i, acc in enumerate(per_level)))
-hit = count = 0
-with torch.no_grad():
-    bins = vq._bins(CONTEXT, LEVELS[0])
-    fut = [i for i, (start, _end) in enumerate(bins) if start >= PREFIX]
-    for start in range(0, probe.shape[0], 4):
-        batch = probe[start : start + 4]
-        codes = vq.encode(batch)
-        cond = torch.zeros(batch.shape[0], batch.shape[1], vq.dim, device=batch.device)
-        cond[:, :PREFIX] = vq.embed(batch[:, :PREFIX])
-        pred = gen.forward_level(cond, 0).argmax(-1)
-        hit += (pred[:, fut] == codes[0][:, fut]).sum().item()
-        count += codes[0][:, fut].numel()
-print(f"held-out coarsest continuation {hit / max(1, count):.3f}  (future codes, given the prefix)")
+print("held-out next-level", " ".join(f"L{i}:{acc:.2f}" for i, acc in enumerate(per_level, start=1)))
+print(f"held-out next code {held_next_code(held):.3f}  (the code for the eight tokens after the prefix)")
 print(f"allocated after training {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 """
 )
@@ -827,10 +845,10 @@ md(
 Three writers, same 128 tokens, same function prefix:
 
 - **Teacher** continues the first `PREFIX` tokens of a validation window. One forward per new token.
-- **Next-concept** encodes the bins that sit entirely inside that prefix, predicts the rest coarse-to-fine, and decodes. One forward per level.
-- **Hybrid** is that draft plus one teacher forward. Tokens inside the prefix stay. Elsewhere, a token the teacher assigns probability below `TAU` is replaced. The replacement does not re-enter that forward, so a comma draft cannot be turned into a function by the repair alone.
+- **Next-concept** encodes the bins inside the prefix. It predicts the next coarse code from the codes before it, eight times, then the finer levels in parallel, and decodes. The first of those codes is the next eight tokens.
+- **Hybrid** is that draft plus one teacher forward. Tokens inside the prefix stay. Elsewhere, a token the teacher assigns probability below `TAU` is replaced. The replacement does not re-enter that forward.
 
-Teacher NLL of the finished window is not enough. A high repair rate inserts the teacher's local mode, which is often a space or a comma, and that mode can score *below* a real continuation. Read the decoded text.
+Read the next eight tokens. A low NLL on a string of parentheses is not a function.
 """
 )
 
@@ -876,7 +894,7 @@ with torch.no_grad():
 
 rows = [
     ("teacher", teacher_nll_value, CONTEXT - PREFIX, teacher_ms / bench_batch, teacher_peak, "greedy continuation"),
-    ("next-concept", ncm_nll_value, len(LEVELS), ncm_ms / bench_batch, ncm_peak, "same prefix"),
+    ("next-concept", ncm_nll_value, len(coarse_future) + len(LEVELS) - 1, ncm_ms / bench_batch, ncm_peak, "same prefix"),
     ("hybrid", hybrid_nll_value, len(LEVELS) + 1, (ncm_ms + repair_ms) / bench_batch, max(ncm_peak, repair_peak), f"repair rate {repair_rate:.0%} of the continuation"),
 ]
 print(f"{'writer':16} {'NLL':>8} {'forwards':>10} {'ms/seq':>10} {'peak GB':>8}  note")
@@ -889,15 +907,20 @@ print("\\n--- round trip (tokenizer ceiling on this window) ---")
 with torch.no_grad():
     trip = vq.logits_from_codes(vq.encode(held[:1])).argmax(-1)
 print(tokenizer.decode(trip[0].tolist(), skip_special_tokens=True)[:500])
+print("\\n--- next eight tokens ---")
+span = CONTEXT // LEVELS[0]
+print("teacher", tokenizer.decode(teacher_tokens[0, PREFIX : PREFIX + span].tolist(), skip_special_tokens=True))
+print("draft  ", tokenizer.decode(draft[0, PREFIX : PREFIX + span].tolist(), skip_special_tokens=True))
+print("hybrid ", tokenizer.decode(hybrid[0, PREFIX : PREFIX + span].tolist(), skip_special_tokens=True))
 print("\\n--- next-concept draft ---")
 print(tokenizer.decode(draft[0], skip_special_tokens=True)[:500])
 print("\\n--- hybrid ---")
 print(tokenizer.decode(hybrid[0], skip_special_tokens=True)[:500])
 
 
-def letter_frac(token_rows):
+def letter_frac(token_rows, start, end):
     scores = []
-    for row in token_rows[:, PREFIX:].tolist():
+    for row in token_rows[:, start:end].tolist():
         hit = 0
         for token_id in row:
             if any(ch.isalpha() for ch in tokenizer.decode([token_id])):
@@ -907,12 +930,18 @@ def letter_frac(token_rows):
 
 
 print(
-    "continuation tokens with a letter: "
-    f"teacher {letter_frac(teacher_tokens):.0%}  "
-    f"draft {letter_frac(draft):.0%}  "
-    f"hybrid {letter_frac(hybrid):.0%}"
+    "next-eight tokens with a letter: "
+    f"teacher {letter_frac(teacher_tokens, PREFIX, PREFIX + span):.0%}  "
+    f"draft {letter_frac(draft, PREFIX, PREFIX + span):.0%}  "
+    f"hybrid {letter_frac(hybrid, PREFIX, PREFIX + span):.0%}"
 )
-print("A draft of '=' and quotes lands near 0%. Trust this line, not the NLL.")
+print(
+    "full continuation tokens with a letter: "
+    f"teacher {letter_frac(teacher_tokens, PREFIX, CONTEXT):.0%}  "
+    f"draft {letter_frac(draft, PREFIX, CONTEXT):.0%}  "
+    f"hybrid {letter_frac(hybrid, PREFIX, CONTEXT):.0%}"
+)
+print("A draft of parentheses lands near 0% on the next-eight line. Trust that line, not the NLL.")
 """
 )
 
